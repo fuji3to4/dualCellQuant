@@ -332,7 +332,39 @@ def integrate_and_quantify(
     np.save(tmp_npy, and_mask)
     tmp_npy.flush(); tmp_npy.close()
 
-    return overlay, tmp_npy.name, df, tmp_csv.name
+    # --- 比率画像の生成（T/R） ---
+    # refが0のところはNaNにして割り算回避
+    valid = (ref_gray > 0)
+    ratio_img = np.full_like(tgt_gray, np.nan, dtype=np.float32)
+    ratio_img[valid] = tgt_gray[valid] / ref_gray[valid]
+
+    # 表示は AND マスク内に限定（外側は黒に落とす）
+    ratio_masked = np.where(and_mask, ratio_img, np.nan)
+
+    # 可視化のために頑健な正規化（外れ値対策で1〜99パーセンタイル）
+    finite_vals = ratio_masked[np.isfinite(ratio_masked)]
+    if finite_vals.size > 0:
+        vmin = np.percentile(finite_vals, 1.0)
+        vmax = np.percentile(finite_vals, 99.0)
+        if vmax <= vmin:
+            vmax = vmin + 1e-6
+        ratio_norm = (ratio_masked - vmin) / (vmax - vmin)
+    else:
+        ratio_norm = np.zeros_like(ratio_masked, dtype=np.float32)
+
+    # NaN→0 にしてグレイスケール
+    ratio_for_viz = np.nan_to_num(ratio_norm, nan=0.0, posinf=0.0, neginf=0.0)
+    #ratio_overlay = colorize_overlay(ratio_for_viz, masks, and_mask) #赤：輪郭、緑：ANDマスク境界
+    ratio_overlay = Image.fromarray((ratio_for_viz * 255).astype(np.uint8))  # マスク線なし
+
+
+    # 生の比率配列を保存（NaN含む）
+    tmp_ratio_npy = tempfile.NamedTemporaryFile(delete=False, suffix=".npy")
+    np.save(tmp_ratio_npy, ratio_img)
+    tmp_ratio_npy.flush(); tmp_ratio_npy.close()
+
+    return overlay, tmp_npy.name, df, tmp_csv.name, ratio_overlay, tmp_ratio_npy.name
+
 
 # -----------------------
 # UI
@@ -399,6 +431,9 @@ def build_ui():
                 mask_npy = gr.File(label="Download AND mask (.npy)")
                 table = gr.Dataframe(label="Per-cell intensities & ratios", interactive=False)
                 csv_file = gr.File(label="Download CSV")
+                
+                ratio_img = gr.Image(type="pil", label="Ratio (Target/Reference) on AND mask", width=600)
+                ratio_npy = gr.File(label="Download ratio (T_over_R) (.npy)")
 
         run_seg_btn.click(
             fn=run_segmentation,
@@ -418,7 +453,7 @@ def build_ui():
         integrate_btn.click(
             fn=integrate_and_quantify,
             inputs=[tgt, ref, masks_state, tgt_mask_state, ref_mask_state, tgt_chan, ref_chan],
-            outputs=[final_overlay, mask_npy, table, csv_file],
+            outputs=[final_overlay, mask_npy, table, csv_file, ratio_img, ratio_npy],
         )
     return demo
 
