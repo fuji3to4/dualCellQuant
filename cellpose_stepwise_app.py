@@ -194,11 +194,12 @@ def run_segmentation(
 
     overlay = colorize_overlay(seg_gray, masks, None)
     overlay = annotate_ids(overlay, masks)
+    mask_viz = vivid_label_image(masks)
 
     tmp_npy = tempfile.NamedTemporaryFile(delete=False, suffix=".npy")
     np.save(tmp_npy, masks)
     tmp_npy.flush(); tmp_npy.close()
-    return overlay, tmp_npy.name, masks
+    return overlay, tmp_npy.name, mask_viz, masks
 
 # -----------------------
 # Step 2/3: Apply mask for target or reference
@@ -325,20 +326,20 @@ def integrate_and_quantify(
 
     overlay = colorize_overlay(tgt_gray, masks, and_mask)
     overlay = annotate_ids(overlay, masks)
-    mask_viz = vivid_label_image(masks)
+   
 
     tmp_npy = tempfile.NamedTemporaryFile(delete=False, suffix=".npy")
     np.save(tmp_npy, and_mask)
     tmp_npy.flush(); tmp_npy.close()
 
-    return overlay, mask_viz, tmp_npy.name, df, tmp_csv.name
+    return overlay, tmp_npy.name, df, tmp_csv.name
 
 # -----------------------
 # UI
 # -----------------------
 
 def build_ui():
-    with gr.Blocks(title="Cellpose-SAM: Stepwise 2-channel Quant") as demo:
+    with gr.Blocks(title="Cellpose2Quant: Stepwise 2-channel Cell Image Quantification using Cellpose-SAM") as demo:
         gr.Markdown(
             """
             # Cellpose-SAM: Stepwise 2-channel Quantification
@@ -355,8 +356,8 @@ def build_ui():
 
         with gr.Row():
             with gr.Column():
-                tgt = gr.Image(type="pil", label="Target image", image_mode="L")
-                ref = gr.Image(type="pil", label="Reference image", image_mode="L")
+                tgt = gr.Image(type="pil", label="Target image", image_mode="L",width=600)
+                ref = gr.Image(type="pil", label="Reference image", image_mode="L",width=600)
 
                 with gr.Accordion("Segmentation params", open=False):
                     seg_source = gr.Radio(["target","reference"], value="target", label="Segment on")
@@ -364,10 +365,11 @@ def build_ui():
                     diameter = gr.Slider(0, 200, value=0, step=1, label="Diameter (px, 0=auto)")
                     flow_th = gr.Slider(0.0, 1.5, value=0.4, step=0.05, label="Flow threshold")
                     cellprob_th = gr.Slider(-6.0, 6.0, value=0.0, step=0.1, label="Cellprob threshold")
-                    use_gpu = gr.Checkbox(value=False, label="Use GPU if available")
-                    run_seg_btn = gr.Button("1. Run Cellpose")
-                    seg_overlay = gr.Image(type="pil", label="Segmentation overlay")
-                    seg_file = gr.File(label="Download masks (.npy)")
+                    use_gpu = gr.Checkbox(value=True, label="Use GPU if available")
+                run_seg_btn = gr.Button("1. Run Cellpose")
+                seg_overlay = gr.Image(type="pil", label="Segmentation overlay",width=600)
+                mask_img = gr.Image(type="pil", label="Segmentation label image",width=600)
+                seg_file = gr.File(label="Download masks (.npy)")
 
                 with gr.Accordion("Target mask", open=False):
                     tgt_chan = gr.Radio([0,1,2,3], value=0, label="Target channel")
@@ -375,9 +377,9 @@ def build_ui():
                     tgt_sat_limit = gr.Slider(0.80, 1.0, value=0.98, step=0.001, label="Saturation limit (Target<limit)")
                     tgt_pct = gr.Slider(0.0, 100.0, value=75.0, step=1.0, label="Percentile (Top p%)")
                     tgt_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
-                    run_tgt_btn = gr.Button("2. Apply Target mask")
-                    tgt_overlay = gr.Image(type="pil", label="Target mask overlay")
-                    tgt_file = gr.File(label="Download target mask (.npy)")
+                run_tgt_btn = gr.Button("2. Apply Target mask")
+                tgt_overlay = gr.Image(type="pil", label="Target mask overlay",width=600)
+                tgt_file = gr.File(label="Download target mask (.npy)")
 
                 with gr.Accordion("Reference mask", open=False):
                     ref_chan = gr.Radio([0,1,2,3], value=0, label="Reference channel")
@@ -385,15 +387,14 @@ def build_ui():
                     ref_sat_limit = gr.Slider(0.80, 1.0, value=0.98, step=0.001, label="Saturation limit (Reference<limit)")
                     ref_pct = gr.Slider(0.0, 100.0, value=75.0, step=1.0, label="Percentile (Top p%)")
                     ref_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
-                    run_ref_btn = gr.Button("3. Apply Reference mask")
-                    ref_overlay = gr.Image(type="pil", label="Reference mask overlay")
-                    ref_file = gr.File(label="Download reference mask (.npy)")
+                run_ref_btn = gr.Button("3. Apply Reference mask")
+                ref_overlay = gr.Image(type="pil", label="Reference mask overlay",width=600)
+                ref_file = gr.File(label="Download reference mask (.npy)")
 
                 integrate_btn = gr.Button("4. Integrate & Quantify")
 
-            with gr.Column():
-                final_overlay = gr.Image(type="pil", label="Final overlay (AND mask)")
-                mask_img = gr.Image(type="pil", label="Segmentation label image")
+                final_overlay = gr.Image(type="pil", label="Final overlay (AND mask)",width=600)
+                
                 mask_npy = gr.File(label="Download AND mask (.npy)")
                 table = gr.Dataframe(label="Per-cell intensities & ratios", interactive=False)
                 csv_file = gr.File(label="Download CSV")
@@ -401,7 +402,7 @@ def build_ui():
         run_seg_btn.click(
             fn=run_segmentation,
             inputs=[tgt, ref, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu],
-            outputs=[seg_overlay, seg_file, masks_state],
+            outputs=[seg_overlay, seg_file, mask_img, masks_state],
         )
         run_tgt_btn.click(
             fn=apply_mask,
@@ -416,7 +417,7 @@ def build_ui():
         integrate_btn.click(
             fn=integrate_and_quantify,
             inputs=[tgt, ref, masks_state, tgt_mask_state, ref_mask_state, tgt_chan, ref_chan],
-            outputs=[final_overlay, mask_img, mask_npy, table, csv_file],
+            outputs=[final_overlay, mask_npy, table, csv_file],
         )
     return demo
 
