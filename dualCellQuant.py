@@ -559,6 +559,9 @@ def build_ui():
                 ratio_img = gr.Image(type="pil", label="Ratio (Target/Reference) on AND mask", width=600)
                 ratio_npy = gr.File(label="Download ratio (T_over_R) (.npy)")
 
+                # Reset saved UI settings
+                reset_settings = gr.Button("Reset saved settings")
+
         run_seg_btn.click(
             fn=run_segmentation,
             inputs=[tgt, ref, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu],
@@ -585,8 +588,152 @@ def build_ui():
             inputs=[tgt, ref, masks_state, tgt_mask_state, ref_mask_state, tgt_chan, ref_chan],
             outputs=[final_overlay, mask_npy, table, csv_file, ratio_img, ratio_npy],
         )
+
+        # -----------------------
+        # Persist UI settings in browser localStorage
+        # -----------------------
+        SETTINGS_KEY = "dcq_settings_v1"
+
+        # Restore saved settings on app load
+        demo.load(
+            fn=None,
+            inputs=[],
+            outputs=[
+                seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu,
+                rad_in, rad_out, rad_min_obj,
+                use_radial_roi_tgt, use_radial_roi_ref,
+                tgt_chan, tgt_mask_mode, tgt_sat_limit, tgt_pct, tgt_min_obj,
+                ref_chan, ref_mask_mode, ref_sat_limit, ref_pct, ref_min_obj,
+            ],
+            js=f"""
+            () => {{
+                try {{
+                    const raw = localStorage.getItem('{SETTINGS_KEY}');
+                    // Defaults aligned with component value= in Python UI
+                    const d = {{
+                        seg_source: 'target', seg_chan: 0, diameter: 0, flow_th: 0.4, cellprob_th: 0.0, use_gpu: true,
+                        rad_in: 0.0, rad_out: 100.0, rad_min_obj: 50,
+                        use_radial_roi_tgt: false, use_radial_roi_ref: false,
+                        tgt_chan: 0, tgt_mask_mode: 'global_percentile', tgt_sat_limit: 0.98, tgt_pct: 75.0, tgt_min_obj: 50,
+                        ref_chan: 0, ref_mask_mode: 'global_percentile', ref_sat_limit: 0.98, ref_pct: 75.0, ref_min_obj: 50,
+                    }};
+                    const s = raw ? {{...d, ...JSON.parse(raw)}} : d;
+                    return [
+                        s.seg_source,
+                        s.seg_chan,
+                        s.diameter,
+                        s.flow_th,
+                        s.cellprob_th,
+                        s.use_gpu,
+                        s.rad_in,
+                        s.rad_out,
+                        s.rad_min_obj,
+                        s.use_radial_roi_tgt,
+                        s.use_radial_roi_ref,
+                        s.tgt_chan,
+                        s.tgt_mask_mode,
+                        s.tgt_sat_limit,
+                        s.tgt_pct,
+                        s.tgt_min_obj,
+                        s.ref_chan,
+                        s.ref_mask_mode,
+                        s.ref_sat_limit,
+                        s.ref_pct,
+                        s.ref_min_obj,
+                    ];
+                }} catch (e) {{
+                    console.warn('Failed to load saved settings:', e);
+                    // Fallback to defaults if parsing/storage fails
+                    return [
+                        'target', 0, 0, 0.4, 0.0, true,
+                        0.0, 100.0, 50,
+                        false, false,
+                        0, 'global_percentile', 0.98, 75.0, 50,
+                        0, 'global_percentile', 0.98, 75.0, 50,
+                    ];
+                }}
+            }}
+            """,
+        )
+
+        # Helper to register change->save for a component key
+        def _persist_change(comp, key: str):
+            comp.change(
+                fn=None,
+                inputs=[comp],
+                outputs=[],
+                js=f"""
+                (v) => {{
+                    try {{
+                        const k = '{SETTINGS_KEY}';
+                        const raw = localStorage.getItem(k);
+                        const s = raw ? JSON.parse(raw) : {{}};
+                        s['{key}'] = v;
+                        localStorage.setItem(k, JSON.stringify(s));
+                    }} catch (e) {{
+                        console.warn('Failed to save setting {key}:', e);
+                    }}
+                }}
+                """,
+            )
+
+        # Register persistence for target/reference and segmentation params
+        _persist_change(seg_source, 'seg_source')
+        _persist_change(seg_chan, 'seg_chan')
+        _persist_change(diameter, 'diameter')
+        _persist_change(flow_th, 'flow_th')
+        _persist_change(cellprob_th, 'cellprob_th')
+        _persist_change(use_gpu, 'use_gpu')
+
+        _persist_change(rad_in, 'rad_in')
+        _persist_change(rad_out, 'rad_out')
+        _persist_change(rad_min_obj, 'rad_min_obj')
+        _persist_change(use_radial_roi_tgt, 'use_radial_roi_tgt')
+        _persist_change(use_radial_roi_ref, 'use_radial_roi_ref')
+
+        _persist_change(tgt_chan, 'tgt_chan')
+        _persist_change(tgt_mask_mode, 'tgt_mask_mode')
+        _persist_change(tgt_sat_limit, 'tgt_sat_limit')
+        _persist_change(tgt_pct, 'tgt_pct')
+        _persist_change(tgt_min_obj, 'tgt_min_obj')
+
+        _persist_change(ref_chan, 'ref_chan')
+        _persist_change(ref_mask_mode, 'ref_mask_mode')
+        _persist_change(ref_sat_limit, 'ref_sat_limit')
+        _persist_change(ref_pct, 'ref_pct')
+        _persist_change(ref_min_obj, 'ref_min_obj')
+
+        # Reset button clears stored settings
+        reset_settings.click(
+            fn=None,
+            inputs=[],
+            outputs=[
+                seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu,
+                rad_in, rad_out, rad_min_obj,
+                use_radial_roi_tgt, use_radial_roi_ref,
+                tgt_chan, tgt_mask_mode, tgt_sat_limit, tgt_pct, tgt_min_obj,
+                ref_chan, ref_mask_mode, ref_sat_limit, ref_pct, ref_min_obj,
+            ],
+            js=f"""
+            () => {{
+                try {{
+                    localStorage.removeItem('{SETTINGS_KEY}');
+                }} catch (e) {{
+                    console.warn('Failed to clear settings:', e);
+                }}
+                alert('Saved settings cleared. Restoring defaults.');
+                return [
+                    'target', 0, 0, 0.4, 0.0, true,
+                    0.0, 100.0, 50,
+                    false, false,
+                    0, 'global_percentile', 0.98, 75.0, 50,
+                    0, 'global_percentile', 0.98, 75.0, 50,
+                ];
+            }}
+            """,
+        )
     return demo
 
-# if __name__ == "__main__":
-#     demo = build_ui()
-#     demo.queue().launch()
+if __name__ == "__main__":
+    demo = build_ui()
+    demo.queue().launch()
