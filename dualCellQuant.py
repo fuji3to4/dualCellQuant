@@ -202,7 +202,85 @@ def run_segmentation(
     return overlay, tmp_npy.name, mask_viz, masks
 
 # -----------------------
-# Step 2/3: Apply mask for target or reference
+# Step2: Radial mask step
+# -----------------------
+
+def radial_mask(
+    masks: np.ndarray,
+    inner_pct: float,
+    outer_pct: float,
+    min_obj_size: int,
+):
+    if masks is None:
+        raise ValueError("Segmentation masks not provided. Run segmentation first.")
+    labels = np.unique(masks); labels = labels[labels > 0]
+    if labels.size == 0:
+        raise ValueError("No cells found in masks.")
+    H, W = masks.shape
+    bg = masks == 0
+    props_map = {p.label: p for p in measure.regionprops(masks)}
+    radial_total = np.zeros_like(masks, dtype=bool)
+    radial_labels = np.zeros_like(masks, dtype=masks.dtype)
+    # 事前計算: 各セルの dmax（中心→境界 最大距離）
+    dmax_table = {}
+    for lab in labels:
+        cell = masks == lab
+        p = props_map.get(int(lab))
+        if p is None or p.area <= 0:
+            continue
+        # 形状追従: セル内の距離変換で中心(最大距離)→境界(0)を正規化
+        di = ndi.distance_transform_edt(cell)
+        dmax = float(di.max())
+        if dmax <= 0:
+            radial_total |= cell
+            continue
+        dmax_table[int(lab)] = dmax
+        # t は中心0.0, 境界1.0
+        t = 1.0 - (di / dmax)
+        rin_t = max(0.0, float(inner_pct)) / 100.0
+        rout_t = max(0.0, float(outer_pct)) / 100.0
+        if rin_t > rout_t:
+            rin_t, rout_t = rout_t, rin_t
+        # 内側帯域（〜100%まで）
+        inside_band = (t >= rin_t) & (t <= min(rout_t, 1.0)) & cell
+        radial_cell = inside_band.copy()
+        radial_cell = cleanup_mask(radial_cell, int(min_obj_size))
+        radial_total |= radial_cell
+        radial_labels[radial_cell] = int(lab)
+
+    # 100%超の外側帯域（背景側）は、背景 EDT と最近傍セル割当でラベル拡張
+    extra_frac = max(0.0, float(outer_pct) / 100.0 - 1.0)
+    if extra_frac > 0.0 and len(dmax_table) > 0:
+        fg = masks > 0
+        dist_bg, idx = ndi.distance_transform_edt(~fg, return_indices=True)
+        # 最近傍のセル画素のラベルを取得
+        nearest_label = masks[idx[0], idx[1]]
+        max_lab = int(masks.max())
+        extra_table = np.zeros(max_lab + 1, dtype=np.float32)
+        for lab, dmax in dmax_table.items():
+            extra_table[int(lab)] = extra_frac * float(dmax)
+        outside_bool = (~fg) & (nearest_label > 0) & (dist_bg > 0) & (dist_bg <= extra_table[nearest_label])
+        # 既に内側で塗られた部分は保持、背景側のみを追加
+        add_mask = outside_bool & bg
+        radial_total |= add_mask
+        # ラベル付与（後勝ちしないよう、未設定領域にのみセット）
+        to_set = (radial_labels == 0) & add_mask
+        radial_labels[to_set] = nearest_label[to_set].astype(radial_labels.dtype)
+
+    # 可視化
+    overlay = colorize_overlay((masks>0).astype(np.float32), masks, radial_total)
+    overlay = annotate_ids(overlay, masks)
+    tmp_bool = tempfile.NamedTemporaryFile(delete=False, suffix=".npy")
+    np.save(tmp_bool, radial_total)
+    tmp_bool.flush(); tmp_bool.close()
+    tmp_lbl = tempfile.NamedTemporaryFile(delete=False, suffix=".npy")
+    np.save(tmp_lbl, radial_labels)
+    tmp_lbl.flush(); tmp_lbl.close()
+    return overlay, tmp_bool.name, radial_total, tmp_lbl.name, radial_labels
+
+
+# -----------------------
+# Step 3/4: Apply mask for target or reference
 # -----------------------
 
 def apply_mask(
@@ -213,6 +291,7 @@ def apply_mask(
     mask_mode: str,
     pct: float,
     min_obj_size: int,
+    roi_labels: Optional[np.ndarray] = None,
 ):
     if masks is None:
         raise ValueError("Segmentation masks not provided. Run segmentation first.")
@@ -229,6 +308,9 @@ def apply_mask(
     labels = np.unique(masks); labels = labels[labels > 0]
     for lab in labels:
         cell = masks == lab
+        if roi_labels is not None:
+            # ROI が指定されている場合は、対応するラベル領域に限定
+            cell = cell & (roi_labels == lab)
         if mask_mode == "none":
             mask_cell = cell
         elif mask_mode in ("global_otsu", "global_percentile"):
@@ -252,7 +334,25 @@ def apply_mask(
     return overlay, tmp_npy.name, mask_total
 
 # -----------------------
-# Step 4: Integrate masks and quantify
+# Helper: apply mask with optional ROI toggle
+# -----------------------
+def apply_mask_with_roi(
+    img: Image.Image,
+    masks: np.ndarray,
+    measure_channel: int,
+    sat_limit: float,
+    mask_mode: str,
+    pct: float,
+    min_obj_size: int,
+    use_roi: bool,
+    roi_labels: Optional[np.ndarray],
+):
+    roi = roi_labels if use_roi else None
+    return apply_mask(img, masks, measure_channel, sat_limit, mask_mode, pct, min_obj_size, roi)
+
+
+# -----------------------
+# Step 5: Integrate masks and quantify
 # -----------------------
 
 def integrate_and_quantify(
@@ -263,6 +363,7 @@ def integrate_and_quantify(
     ref_mask: np.ndarray,
     tgt_chan: int,
     ref_chan: int,
+
 ):
     if masks is None or tgt_mask is None or ref_mask is None:
         raise ValueError("Run previous steps first.")
@@ -286,11 +387,13 @@ def integrate_and_quantify(
         area_cell = int(cell.sum())
         area_and = int(idx.sum())
         if area_and == 0:
-            mean_t_mem = sum_t_mem = mean_r_mem = sum_r_mem = ratio_mean = ratio_sum = ratio_std = np.nan
+            mean_t_mem = std_t_mem = sum_t_mem = mean_r_mem = std_r_mem = sum_r_mem = ratio_mean = ratio_sum = ratio_std = np.nan
         else:
             mean_t_mem = float(np.mean(tgt_gray[idx]))
+            std_t_mem = float(np.std(tgt_gray[idx]))
             sum_t_mem = float(np.sum(tgt_gray[idx]))
             mean_r_mem = float(np.mean(ref_gray[idx]))
+            std_r_mem = float(np.std(ref_gray[idx]))
             sum_r_mem = float(np.sum(ref_gray[idx]))
             if np.all(ref_gray[idx] > 0):
                 ratio_vals = tgt_gray[idx] / ref_gray[idx]
@@ -300,24 +403,31 @@ def integrate_and_quantify(
             else:
                 ratio_mean = ratio_std = ratio_sum = np.nan
         mean_t_whole = float(np.mean(tgt_gray[cell]))
+        std_t_whole = float(np.std(tgt_gray[cell]))
         sum_t_whole = float(np.sum(tgt_gray[cell]))
         mean_r_whole = float(np.mean(ref_gray[cell]))
+        std_r_whole = float(np.std(ref_gray[cell]))
         sum_r_whole = float(np.sum(ref_gray[cell]))
         rows.append({
             "label": int(lab),
             "area_cell_px": area_cell,
             "area_and_px": area_and,
-            "mean_target_on_mask": mean_t_mem,
             "sum_target_on_mask": sum_t_mem,
-            "mean_reference_on_mask": mean_r_mem,
+            "mean_target_on_mask": mean_t_mem,
+            "std_target_on_mask": std_t_mem,
             "sum_reference_on_mask": sum_r_mem,
-            "ratio_sum_T_over_R": ratio_sum,
-            "ratio_mean_T_over_R": ratio_mean,
-            "ratio_std_T_over_R": ratio_std,
-            "mean_target_whole": mean_t_whole,
+            "mean_reference_on_mask": mean_r_mem,
+            "std_reference_on_mask": std_r_mem,  
+            "sum_ratio_T_over_R": ratio_sum,
+            "mean_ratio_T_over_R": ratio_mean,
+            "std_ratio_T_over_R": ratio_std,
             "sum_target_whole": sum_t_whole,
-            "mean_reference_whole": mean_r_whole,
+            "mean_target_whole": mean_t_whole,
+            "std_target_whole": std_t_whole,
             "sum_reference_whole": sum_r_whole,
+            "mean_reference_whole": mean_r_whole,
+            "std_reference_whole": std_r_whole,
+
         })
 
     df = pd.DataFrame(rows).sort_values("label")
@@ -384,8 +494,11 @@ def build_ui():
             """
         )
         masks_state = gr.State()
+        radial_mask_state = gr.State()           # bool mask
+        radial_label_state = gr.State()          # labeled mask
         tgt_mask_state = gr.State()
         ref_mask_state = gr.State()
+        
 
         with gr.Row():
             with gr.Column():
@@ -403,6 +516,16 @@ def build_ui():
                 seg_overlay = gr.Image(type="pil", label="Segmentation overlay",width=600)
                 mask_img = gr.Image(type="pil", label="Segmentation label image",width=600)
                 seg_file = gr.File(label="Download masks (.npy)")
+                with gr.Accordion("Radial mask (optional)", open=False):
+                    rad_in = gr.Slider(0.0, 120.0, value=0.0, step=1.0, label="Radial inner % (0=中心)")
+                    rad_out = gr.Slider(0.0, 120.0, value=100.0, step=1.0, label="Radial outer % (100=境界)")
+                    rad_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
+                run_rad_btn = gr.Button("2b. Build Radial mask")
+                rad_overlay = gr.Image(type="pil", label="Radial mask overlay", width=600)
+                rad_file = gr.File(label="Download radial mask (bool .npy)")
+                rad_lbl_file = gr.File(label="Download radial labels (.npy)")
+                use_radial_roi_tgt = gr.Checkbox(value=False, label="Use Radial ROI for Target mask")
+                use_radial_roi_ref = gr.Checkbox(value=False, label="Use Radial ROI for Reference mask")
 
                 with gr.Accordion("Target mask", open=False):
                     tgt_chan = gr.Radio([0,1,2,3], value=0, label="Target channel")
@@ -440,14 +563,20 @@ def build_ui():
             inputs=[tgt, ref, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu],
             outputs=[seg_overlay, seg_file, mask_img, masks_state],
         )
+        run_rad_btn.click(
+            fn=radial_mask,
+            inputs=[masks_state, rad_in, rad_out, rad_min_obj],
+            outputs=[rad_overlay, rad_file, radial_mask_state, rad_lbl_file, radial_label_state],
+        )
+        # Wrapper that passes ROI based on checkbox
         run_tgt_btn.click(
-            fn=apply_mask,
-            inputs=[tgt, masks_state, tgt_chan, tgt_sat_limit, tgt_mask_mode, tgt_pct, tgt_min_obj],
+            fn=apply_mask_with_roi,
+            inputs=[tgt, masks_state, tgt_chan, tgt_sat_limit, tgt_mask_mode, tgt_pct, tgt_min_obj, use_radial_roi_tgt, radial_label_state],
             outputs=[tgt_overlay, tgt_file, tgt_mask_state],
         )
         run_ref_btn.click(
-            fn=apply_mask,
-            inputs=[ref, masks_state, ref_chan, ref_sat_limit, ref_mask_mode, ref_pct, ref_min_obj],
+            fn=apply_mask_with_roi,
+            inputs=[ref, masks_state, ref_chan, ref_sat_limit, ref_mask_mode, ref_pct, ref_min_obj, use_radial_roi_ref, radial_label_state],
             outputs=[ref_overlay, ref_file, ref_mask_state],
         )
         integrate_btn.click(
