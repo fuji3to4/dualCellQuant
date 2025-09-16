@@ -38,29 +38,95 @@ def get_model(use_gpu: bool = False) -> models.CellposeModel:
 
 def pil_to_numpy(img: Image.Image) -> np.ndarray:
     arr = np.array(img)
-    if arr.ndim == 2:
-        arr = arr.astype(np.float32)
-    elif arr.ndim == 3 and arr.shape[2] == 4:
-        arr = arr[:, :, :3].astype(np.float32)
-    elif arr.ndim == 3 and arr.shape[2] == 3:
-        arr = arr.astype(np.float32)
+    orig_dtype = arr.dtype
+
+    # Drop alpha channel if present (RGBA -> RGB)
+    if arr.ndim == 3 and arr.shape[2] == 4:
+        arr = arr[:, :, :3]
+
+    # Convert to float for downstream processing
+    arr = arr.astype(np.float32, copy=False)
+
+    # Normalize to [0, 1] depending on original dtype
+    if np.issubdtype(orig_dtype, np.integer):
+        # e.g., uint8 -> 255, uint16 -> 65535
+        max_val = float(np.iinfo(orig_dtype).max)
+        if max_val > 1:
+            arr /= max_val
+    elif np.issubdtype(orig_dtype, np.floating):
+        # If floats come in with a larger range, normalize defensively
+        m = np.nanmax(arr)
+        if m > 1.0:
+            # Avoid divide-by-zero
+            arr /= (m if m != 0 else 1.0)
+    elif np.issubdtype(orig_dtype, np.bool_):
+        # Already 0/1
+        pass
     else:
-        raise ValueError(f"Unsupported image shape: {arr.shape}")
-    if arr.max() > 1.0:
-        arr /= 255.0
+        # Fallback: if something unexpected slips through, clip to [0,1]
+        arr = np.clip(arr, 0.0, 1.0)
+
     return arr
 
+# 8bit絶対値(0-255)で指定されたSaturation limitを画像ネイティブの0-1に変換
+def _to_float_saturation_limit(img: Image.Image, sat_limit_abs_8bit: float) -> float:
+    raw = np.array(img)
+    # RGBA -> RGB へ
+    if raw.ndim == 3 and raw.shape[2] == 4:
+        raw = raw[:, :, :3]
 
-def extract_single_channel(img: np.ndarray, chan: int) -> np.ndarray:
-    if img.ndim == 2:
-        return img
-    if chan == 0:
-        r, g, b = img[:, :, 0], img[:, :, 1], img[:, :, 2]
-        return (0.2989 * r + 0.5870 * g + 0.1140 * b).astype(np.float32)
-    elif chan in (1, 2, 3):
-        return img[:, :, chan - 1].astype(np.float32)
+    ref_max = 255.0
+    if np.issubdtype(raw.dtype, np.integer):
+        native_max = float(np.iinfo(raw.dtype).max)  # 255, 65535 など
+    elif np.issubdtype(raw.dtype, np.floating):
+        # 浮動小数は0-1想定（PIL 'F'などの場合は値域を見て判断）
+        vmax = float(np.nanmax(raw)) if raw.size > 0 else 1.0
+        native_max = 1.0 if vmax <= 1.0 else vmax
     else:
+        native_max = 1.0
+
+    # 8bit基準 -> ネイティブ絶対値へ変換
+    if native_max <= ref_max:
+        sat_native = float(np.clip(sat_limit_abs_8bit, 0.0, native_max))
+    else:
+        scale = native_max / ref_max
+        sat_native = float(np.clip(sat_limit_abs_8bit * scale, 0.0, native_max))
+
+    # ネイティブ絶対値 -> 0-1へ
+    thr01 = sat_native / (native_max if native_max > 0 else 1.0)
+    return float(np.clip(thr01, 0.0, 1.0))
+
+
+def extract_single_channel(img: np.ndarray, chan) -> np.ndarray:
+    """Extract a single channel as float32 grayscale in [0,1].
+
+    chan can be one of:
+      - strings: "gray", "R", "G", "B"
+      - legacy ints: 0(gray), 1(R), 2(G), 3(B)
+    """
+    if img.ndim == 2:
+        return img.astype(np.float32, copy=False)
+
+    # Normalize channel key
+    key = chan
+    if isinstance(chan, str):
+        key = chan.strip().lower()
+    elif isinstance(chan, (int, np.integer)):
+        key = {0: "gray", 1: "r", 2: "g", 3: "b"}.get(int(chan), None)
+
+    if key is None:
         raise ValueError("Invalid channel selection")
+
+    r, g, b = img[:, :, 0], img[:, :, 1], img[:, :, 2]
+    if key in ("gray", "grey"):
+        return (0.2989 * r + 0.5870 * g + 0.1140 * b).astype(np.float32)
+    if key == "r":
+        return r.astype(np.float32)
+    if key == "g":
+        return g.astype(np.float32)
+    if key == "b":
+        return b.astype(np.float32)
+    raise ValueError("Invalid channel selection")
 
 # -----------------------
 # Visualization
@@ -114,21 +180,19 @@ def annotate_ids(img: Image.Image, masks: np.ndarray) -> Image.Image:
 # Threshold utilities
 # -----------------------
 
-def global_threshold_mask(img_gray: np.ndarray, sat_limit: float, mode: str, pct: float, min_obj_size: int) -> Tuple[np.ndarray, float]:
-    nonsat = img_gray < sat_limit
+def global_threshold_mask(img_gray: np.ndarray, nonsat_mask: np.ndarray, mode: str, pct: float, min_obj_size: int) -> Tuple[np.ndarray, float]:
+    valid = img_gray[nonsat_mask]
+    if valid.size == 0:
+        raise ValueError("All pixels are saturated; lower the saturation limit")
+
     if mode == "global_otsu":
-        valid = img_gray[nonsat]
-        if valid.size == 0:
-            raise ValueError("All pixels are saturated; lower the saturation limit")
         th = float(filters.threshold_otsu(valid))
     elif mode == "global_percentile":
-        valid = img_gray[nonsat]
-        if valid.size == 0:
-            raise ValueError("All pixels are saturated; lower the saturation limit")
         th = float(np.percentile(valid, float(np.clip(pct, 0.0, 100.0))))
     else:
         raise ValueError("global_threshold_mask called with invalid mode")
-    mask = (img_gray >= th) & nonsat
+
+    mask = (img_gray >= th) & nonsat_mask
     if min_obj_size > 0:
         mask = morphology.remove_small_objects(mask, min_size=int(min_obj_size))
         mask = morphology.binary_opening(mask, morphology.disk(1))
@@ -298,12 +362,16 @@ def apply_mask(
 
     arr = pil_to_numpy(img)
     gray = extract_single_channel(arr, measure_channel)
-    nonsat = gray < float(sat_limit)
+
+    # Saturation limit: UIは8bit絶対値(0-255)で入力 -> 0-1へ変換して使用
+    sat_thr01 = _to_float_saturation_limit(img, float(sat_limit))
+    nonsat = gray < sat_thr01
+
     mask_total = np.zeros_like(masks, dtype=bool)
 
     global_mask = None
     if mask_mode in ("global_otsu", "global_percentile"):
-        global_mask, _ = global_threshold_mask(gray, float(sat_limit), mask_mode, float(pct), int(min_obj_size))
+        global_mask, _ = global_threshold_mask(gray, nonsat, mask_mode, float(pct), int(min_obj_size))
 
     labels = np.unique(masks); labels = labels[labels > 0]
     for lab in labels:
@@ -312,7 +380,8 @@ def apply_mask(
             # ROI が指定されている場合は、対応するラベル領域に限定
             cell = cell & (roi_labels == lab)
         if mask_mode == "none":
-            mask_cell = cell
+            # Noneでも Saturation limit は適用
+            mask_cell = cell & nonsat
         elif mask_mode in ("global_otsu", "global_percentile"):
             mask_cell = global_mask & cell
             mask_cell = cleanup_mask(mask_cell, int(min_obj_size))
@@ -500,15 +569,14 @@ def build_ui():
         tgt_mask_state = gr.State()
         ref_mask_state = gr.State()
         
-
         with gr.Row():
             with gr.Column():
-                tgt = gr.Image(type="pil", label="Target image", image_mode="L",width=600)
-                ref = gr.Image(type="pil", label="Reference image", image_mode="L",width=600)
+                tgt = gr.Image(type="pil", label="Target image", image_mode="RGB", width=600)
+                ref = gr.Image(type="pil", label="Reference image", image_mode="RGB", width=600)
 
                 with gr.Accordion("Segmentation params", open=False):
                     seg_source = gr.Radio(["target","reference"], value="target", label="Segment on")
-                    seg_chan = gr.Radio([0,1,2,3], value=0, label="Segmentation channel")
+                    seg_chan = gr.Radio(["gray","R","G","B"], value="gray", label="Segmentation channel")
                     diameter = gr.Slider(0, 200, value=0, step=1, label="Diameter (px, 0=auto)")
                     flow_th = gr.Slider(0.0, 1.5, value=0.4, step=0.05, label="Flow threshold")
                     cellprob_th = gr.Slider(-6.0, 6.0, value=0.0, step=0.1, label="Cellprob threshold")
@@ -529,9 +597,10 @@ def build_ui():
                 use_radial_roi_ref = gr.Checkbox(value=False, label="Use Radial ROI for Reference mask")
 
                 with gr.Accordion("Target mask", open=False):
-                    tgt_chan = gr.Radio([0,1,2,3], value=0, label="Target channel")
+                    tgt_chan = gr.Radio(["gray","R","G","B"], value="gray", label="Target channel")
                     tgt_mask_mode = gr.Radio(["none","global_percentile","global_otsu","per_cell_percentile","per_cell_otsu"], value="global_percentile", label="Masking mode")
-                    tgt_sat_limit = gr.Slider(0.80, 1.0, value=0.98, step=0.001, label="Saturation limit (Target<limit)")
+                    # 8bit絶対値（0-255）指定に変更
+                    tgt_sat_limit = gr.Slider(0, 255, value=254, step=1, label="Saturation limit (abs, 8-bit scale)")
                     tgt_pct = gr.Slider(0.0, 100.0, value=75.0, step=1.0, label="Percentile (Top p%)")
                     tgt_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
                 run_tgt_btn = gr.Button("3. Apply Target mask")
@@ -539,9 +608,10 @@ def build_ui():
                 tgt_file = gr.File(label="Download target mask (.npy)")
 
                 with gr.Accordion("Reference mask", open=False):
-                    ref_chan = gr.Radio([0,1,2,3], value=0, label="Reference channel")
+                    ref_chan = gr.Radio(["gray","R","G","B"], value="gray", label="Reference channel")
                     ref_mask_mode = gr.Radio(["none","global_percentile","global_otsu","per_cell_percentile","per_cell_otsu"], value="global_percentile", label="Masking mode")
-                    ref_sat_limit = gr.Slider(0.80, 1.0, value=0.98, step=0.001, label="Saturation limit (Reference<limit)")
+                    # 8bit絶対値（0-255）指定に変更
+                    ref_sat_limit = gr.Slider(0, 255, value=254, step=1, label="Saturation limit (abs, 8-bit scale)")
                     ref_pct = gr.Slider(0.0, 100.0, value=75.0, step=1.0, label="Percentile (Top p%)")
                     ref_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
                 run_ref_btn = gr.Button("4. Apply Reference mask")
@@ -611,13 +681,18 @@ def build_ui():
                     const raw = localStorage.getItem('{SETTINGS_KEY}');
                     // Defaults aligned with component value= in Python UI
                     const d = {{
-                        seg_source: 'target', seg_chan: 0, diameter: 0, flow_th: 0.4, cellprob_th: 0.0, use_gpu: true,
+                        seg_source: 'target', seg_chan: 'gray', diameter: 0, flow_th: 0.4, cellprob_th: 0.0, use_gpu: true,
                         rad_in: 0.0, rad_out: 100.0, rad_min_obj: 50,
                         use_radial_roi_tgt: false, use_radial_roi_ref: false,
-                        tgt_chan: 0, tgt_mask_mode: 'global_percentile', tgt_sat_limit: 0.98, tgt_pct: 75.0, tgt_min_obj: 50,
-                        ref_chan: 0, ref_mask_mode: 'global_percentile', ref_sat_limit: 0.98, ref_pct: 75.0, ref_min_obj: 50,
+                        tgt_chan: 'gray', tgt_mask_mode: 'global_percentile', tgt_sat_limit: 254, tgt_pct: 75.0, tgt_min_obj: 50,
+                        ref_chan: 'gray', ref_mask_mode: 'global_percentile', ref_sat_limit: 254, ref_pct: 75.0, ref_min_obj: 50,
                     }};
-                    const s = raw ? {{...d, ...JSON.parse(raw)}} : d;
+                    let s = raw ? {{...d, ...JSON.parse(raw)}} : d;
+                    // Backward compatibility: map numeric channels to strings if needed
+                    const mapChan = (v) => ({{0:'gray',1:'R',2:'G',3:'B'}})[v] ?? v;
+                    s.seg_chan = mapChan(s.seg_chan);
+                    s.tgt_chan = mapChan(s.tgt_chan);
+                    s.ref_chan = mapChan(s.ref_chan);
                     return [
                         s.seg_source,
                         s.seg_chan,
@@ -645,11 +720,11 @@ def build_ui():
                     console.warn('Failed to load saved settings:', e);
                     // Fallback to defaults if parsing/storage fails
                     return [
-                        'target', 0, 0, 0.4, 0.0, true,
+                        'target', 'gray', 0, 0.4, 0.0, true,
                         0.0, 100.0, 50,
                         false, false,
-                        0, 'global_percentile', 0.98, 75.0, 50,
-                        0, 'global_percentile', 0.98, 75.0, 50,
+                        'gray', 'global_percentile', 254, 75.0, 50,
+                        'gray', 'global_percentile', 254, 75.0, 50,
                     ];
                 }}
             }}
@@ -723,11 +798,11 @@ def build_ui():
                 }}
                 alert('Saved settings cleared. Restoring defaults.');
                 return [
-                    'target', 0, 0, 0.4, 0.0, true,
+                    'target', 'gray', 0, 0.4, 0.0, true,
                     0.0, 100.0, 50,
                     false, false,
-                    0, 'global_percentile', 0.98, 75.0, 50,
-                    0, 'global_percentile', 0.98, 75.0, 50,
+                    'gray', 'global_percentile', 254, 75.0, 50,
+                    'gray', 'global_percentile', 254, 75.0, 50,
                 ];
             }}
             """,
