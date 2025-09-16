@@ -487,9 +487,10 @@ def build_ui():
             # 🔬 **DualCellQuant**
             *Segment, filter, and compare cells across two fluorescence channels*
             1. **Run Cellpose-SAM** to obtain segmentation masks.
-            2. **Apply Target mask** conditions.
-            3. **Apply Reference mask** conditions.
-            4. **Integrate** Target & Reference masks and view results.
+            2. **Build Radial mask** (optional).
+            3. **Apply Target mask** conditions.
+            4. **Apply Reference mask** conditions.
+            5. **Integrate** Target & Reference masks and view results.
             Each step can be rerun to tune parameters before integration.
             """
         )
