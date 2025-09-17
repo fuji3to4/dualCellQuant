@@ -68,6 +68,37 @@ def pil_to_numpy(img: Image.Image) -> np.ndarray:
 
     return arr
 
+def pil_to_numpy_native(img: Image.Image) -> np.ndarray:
+    """Convert PIL image to numpy float32 array without normalizing intensities.
+
+    - Keeps the original numeric scale (e.g., 0-255 for 8-bit, 0-65535 for 16-bit).
+    - Drops alpha channel if present.
+    - Returns float32 array for numerical operations while preserving value scale.
+    """
+    arr = np.array(img)
+    if arr.ndim == 3 and arr.shape[2] == 4:
+        arr = arr[:, :, :3]
+    return arr.astype(np.float32, copy=False)
+
+# --- ImageJ向けTIFF保存ヘルパー ---
+def save_bool_mask_tiff(mask: np.ndarray, stem: str) -> str:
+    """Save boolean mask as 8-bit TIFF (0/255) for ImageJ."""
+    arr = (mask.astype(np.uint8) * 255)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{stem}.tif")
+    Image.fromarray(arr).save(tmp.name)
+    return tmp.name
+
+def save_label_tiff(labels: np.ndarray, stem: str) -> str:
+    """Save label image as 16-bit TIFF (or 32-bit float if labels > 65535)."""
+    maxv = int(labels.max()) if labels.size > 0 else 0
+    if maxv <= 65535:
+        out = labels.astype(np.uint16, copy=False)
+    else:
+        out = labels.astype(np.float32, copy=False)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{stem}.tif")
+    Image.fromarray(out).save(tmp.name)
+    return tmp.name
+
 # 8bit絶対値(0-255)で指定されたSaturation limitを画像ネイティブの0-1に変換
 def _to_float_saturation_limit(img: Image.Image, sat_limit_abs_8bit: float) -> float:
     raw = np.array(img)
@@ -160,7 +191,8 @@ def vivid_label_image(masks: np.ndarray) -> Image.Image:
 def annotate_ids(img: Image.Image, masks: np.ndarray) -> Image.Image:
     draw = ImageDraw.Draw(img)
     w, h = img.size
-    fsize = max(10, int(min(w, h) * 0.02))
+    # Larger, more legible font size
+    fsize = max(14, int(min(w, h) * 0.035))
     try:
         font = ImageFont.truetype("arial.ttf", fsize)
     except Exception:
@@ -171,9 +203,13 @@ def annotate_ids(img: Image.Image, masks: np.ndarray) -> Image.Image:
         cy, cx = p.centroid
         x, y = int(cx), int(cy)
         text = str(lab)
-        for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
-            draw.text((x+dx, y+dy), text, fill=(255,255,255), font=font, anchor="mm")
-        draw.text((x, y), text, fill=(0,0,0), font=font, anchor="mm")
+        # Thicker outline for visibility
+        outline_color = (0, 0, 0)
+        for dx, dy in [(-2,0),(2,0),(0,-2),(0,2),(-2,-2),(2,2),(-2,2),(2,-2)]:
+            draw.text((x+dx, y+dy), text, fill=outline_color, font=font, anchor="mm")
+        # Bright fill color to stand out on grayscale background
+        fill_color = (255, 255, 0)  # yellow
+        draw.text((x, y), text, fill=fill_color, font=font, anchor="mm")
     return img
 
 # -----------------------
@@ -263,7 +299,8 @@ def run_segmentation(
     tmp_npy = tempfile.NamedTemporaryFile(delete=False, suffix=".npy")
     np.save(tmp_npy, masks)
     tmp_npy.flush(); tmp_npy.close()
-    return overlay, tmp_npy.name, mask_viz, masks
+    seg_tiff = save_label_tiff(masks, "seg_labels")
+    return overlay, tmp_npy.name, seg_tiff, mask_viz, masks
 
 # -----------------------
 # Step2: Radial mask step
@@ -340,7 +377,9 @@ def radial_mask(
     tmp_lbl = tempfile.NamedTemporaryFile(delete=False, suffix=".npy")
     np.save(tmp_lbl, radial_labels)
     tmp_lbl.flush(); tmp_lbl.close()
-    return overlay, tmp_bool.name, radial_total, tmp_lbl.name, radial_labels
+    rad_bool_tiff = save_bool_mask_tiff(radial_total, "radial_mask")
+    rad_lbl_tiff = save_label_tiff(radial_labels, "radial_labels")
+    return overlay, tmp_bool.name, radial_total, tmp_lbl.name, radial_labels, rad_bool_tiff, rad_lbl_tiff
 
 
 # -----------------------
@@ -356,6 +395,7 @@ def apply_mask(
     pct: float,
     min_obj_size: int,
     roi_labels: Optional[np.ndarray] = None,
+    mask_name: str = "mask",
 ):
     if masks is None:
         raise ValueError("Segmentation masks not provided. Run segmentation first.")
@@ -400,7 +440,8 @@ def apply_mask(
     tmp_npy = tempfile.NamedTemporaryFile(delete=False, suffix=".npy")
     np.save(tmp_npy, mask_total)
     tmp_npy.flush(); tmp_npy.close()
-    return overlay, tmp_npy.name, mask_total
+    tiff_path = save_bool_mask_tiff(mask_total, mask_name)
+    return overlay, tmp_npy.name, tiff_path, mask_total
 
 # -----------------------
 # Helper: apply mask with optional ROI toggle
@@ -415,9 +456,10 @@ def apply_mask_with_roi(
     min_obj_size: int,
     use_roi: bool,
     roi_labels: Optional[np.ndarray],
+    mask_name: str,
 ):
     roi = roi_labels if use_roi else None
-    return apply_mask(img, masks, measure_channel, sat_limit, mask_mode, pct, min_obj_size, roi)
+    return apply_mask(img, masks, measure_channel, sat_limit, mask_mode, pct, min_obj_size, roi, mask_name)
 
 
 # -----------------------
@@ -432,55 +474,76 @@ def integrate_and_quantify(
     ref_mask: np.ndarray,
     tgt_chan: int,
     ref_chan: int,
+    pixel_width_um: float,
+    pixel_height_um: float,
 
 ):
     if masks is None or tgt_mask is None or ref_mask is None:
         raise ValueError("Run previous steps first.")
 
-    tgt = pil_to_numpy(target_img)
-    ref = pil_to_numpy(reference_img)
-    if tgt.shape[:2] != ref.shape[:2]:
+    # Visualization arrays (0-1) for overlays/ratio
+    tgt_vis = pil_to_numpy(target_img)
+    ref_vis = pil_to_numpy(reference_img)
+    if tgt_vis.shape[:2] != ref_vis.shape[:2]:
         raise ValueError("Image size mismatch between target and reference")
 
-    tgt_gray = extract_single_channel(tgt, tgt_chan)
-    ref_gray = extract_single_channel(ref, ref_chan)
+    # Native arrays (original scale) for measurements to match ImageJ
+    tgt_nat = pil_to_numpy_native(target_img)
+    ref_nat = pil_to_numpy_native(reference_img)
+
+    tgt_gray_vis = extract_single_channel(tgt_vis, tgt_chan)
+    ref_gray_vis = extract_single_channel(ref_vis, ref_chan)
+    tgt_gray_nat = extract_single_channel(tgt_nat, tgt_chan)
+    ref_gray_nat = extract_single_channel(ref_nat, ref_chan)
 
     and_mask = tgt_mask & ref_mask
     labels = np.unique(masks); labels = labels[labels > 0]
     vis_union = np.zeros_like(masks, dtype=bool)
+    # Area conversion (um^2 per pixel)
+    try:
+        px_area_um2 = float(pixel_width_um) * float(pixel_height_um)
+    except Exception:
+        px_area_um2 = 1.0
+
     rows = []
     for lab in labels:
         cell = masks == lab
         idx = and_mask & cell
         vis_union |= idx
-        area_cell = int(cell.sum())
-        area_and = int(idx.sum())
-        if area_and == 0:
+        area_cell_px = int(cell.sum())
+        area_and_px = int(idx.sum())
+        area_cell_um2 = float(area_cell_px) * px_area_um2
+        area_and_um2 = float(area_and_px) * px_area_um2
+        if area_and_px == 0:
             mean_t_mem = std_t_mem = sum_t_mem = mean_r_mem = std_r_mem = sum_r_mem = ratio_mean = ratio_sum = ratio_std = np.nan
         else:
-            mean_t_mem = float(np.mean(tgt_gray[idx]))
-            std_t_mem = float(np.std(tgt_gray[idx]))
-            sum_t_mem = float(np.sum(tgt_gray[idx]))
-            mean_r_mem = float(np.mean(ref_gray[idx]))
-            std_r_mem = float(np.std(ref_gray[idx]))
-            sum_r_mem = float(np.sum(ref_gray[idx]))
-            if np.all(ref_gray[idx] > 0):
-                ratio_vals = tgt_gray[idx] / ref_gray[idx]
+            # Use native intensities for statistics (ImageJ-like)
+            mean_t_mem = float(np.mean(tgt_gray_nat[idx]))
+            std_t_mem = float(np.std(tgt_gray_nat[idx]))
+            sum_t_mem = float(np.sum(tgt_gray_nat[idx]))
+            mean_r_mem = float(np.mean(ref_gray_nat[idx]))
+            std_r_mem = float(np.std(ref_gray_nat[idx]))
+            sum_r_mem = float(np.sum(ref_gray_nat[idx]))
+            if np.all(ref_gray_nat[idx] > 0):
+                ratio_vals = tgt_gray_nat[idx] / ref_gray_nat[idx]
                 ratio_mean = float(np.mean(ratio_vals))
                 ratio_std = float(np.std(ratio_vals))
                 ratio_sum = float(np.sum(ratio_vals))
             else:
                 ratio_mean = ratio_std = ratio_sum = np.nan
-        mean_t_whole = float(np.mean(tgt_gray[cell]))
-        std_t_whole = float(np.std(tgt_gray[cell]))
-        sum_t_whole = float(np.sum(tgt_gray[cell]))
-        mean_r_whole = float(np.mean(ref_gray[cell]))
-        std_r_whole = float(np.std(ref_gray[cell]))
-        sum_r_whole = float(np.sum(ref_gray[cell]))
+        # Whole-cell stats also in native intensity scale
+        mean_t_whole = float(np.mean(tgt_gray_nat[cell])) if area_cell_px > 0 else np.nan
+        std_t_whole = float(np.std(tgt_gray_nat[cell])) if area_cell_px > 0 else np.nan
+        sum_t_whole = float(np.sum(tgt_gray_nat[cell])) if area_cell_px > 0 else np.nan
+        mean_r_whole = float(np.mean(ref_gray_nat[cell])) if area_cell_px > 0 else np.nan
+        std_r_whole = float(np.std(ref_gray_nat[cell])) if area_cell_px > 0 else np.nan
+        sum_r_whole = float(np.sum(ref_gray_nat[cell])) if area_cell_px > 0 else np.nan
         rows.append({
             "label": int(lab),
-            "area_cell_px": area_cell,
-            "area_and_px": area_and,
+            "area_cell_px": area_cell_px,
+            "area_cell_um2": area_cell_um2,
+            "area_and_px": area_and_px,
+            "area_and_um2": area_and_um2,
             "sum_target_on_mask": sum_t_mem,
             "mean_target_on_mask": mean_t_mem,
             "std_target_on_mask": std_t_mem,
@@ -503,19 +566,20 @@ def integrate_and_quantify(
     tmp_csv = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
     df.to_csv(tmp_csv.name, index=False)
 
-    overlay = colorize_overlay(tgt_gray, masks, and_mask)
+    overlay = colorize_overlay(tgt_gray_vis, masks, and_mask)
     overlay = annotate_ids(overlay, masks)
    
 
     tmp_npy = tempfile.NamedTemporaryFile(delete=False, suffix=".npy")
     np.save(tmp_npy, and_mask)
     tmp_npy.flush(); tmp_npy.close()
+    and_tiff = save_bool_mask_tiff(and_mask, "and_mask")
 
     # --- 比率画像の生成（T/R） ---
     # refが0のところはNaNにして割り算回避
-    valid = (ref_gray > 0)
-    ratio_img = np.full_like(tgt_gray, np.nan, dtype=np.float32)
-    ratio_img[valid] = tgt_gray[valid] / ref_gray[valid]
+    valid = (ref_gray_vis > 0)
+    ratio_img = np.full_like(tgt_gray_vis, np.nan, dtype=np.float32)
+    ratio_img[valid] = tgt_gray_vis[valid] / ref_gray_vis[valid]
 
     # 表示は AND マスク内に限定（外側は黒に落とす）
     ratio_masked = np.where(and_mask, ratio_img, np.nan)
@@ -542,7 +606,7 @@ def integrate_and_quantify(
     np.save(tmp_ratio_npy, ratio_img)
     tmp_ratio_npy.flush(); tmp_ratio_npy.close()
 
-    return overlay, tmp_npy.name, df, tmp_csv.name, ratio_overlay, tmp_ratio_npy.name
+    return overlay, tmp_npy.name, and_tiff, df, tmp_csv.name, ratio_overlay, tmp_ratio_npy.name
 
 
 # -----------------------
@@ -584,15 +648,24 @@ def build_ui():
                 run_seg_btn = gr.Button("1. Run Cellpose")
                 seg_overlay = gr.Image(type="pil", label="Segmentation overlay",width=600)
                 mask_img = gr.Image(type="pil", label="Segmentation label image",width=600)
-                seg_file = gr.File(label="Download masks (.npy)")
+                # seg_npy_state = gr.File(label="Download masks (.npy)")
+                seg_npy_state = gr.State()
+                seg_tiff_file = gr.File(label="Download masks (label TIFF)")
+                # Hidden holders to capture .npy paths without showing download widgets
+                
                 with gr.Accordion("Radial mask (optional)", open=False):
                     rad_in = gr.Slider(0.0, 120.0, value=0.0, step=1.0, label="Radial inner % (0=中心)")
                     rad_out = gr.Slider(0.0, 120.0, value=100.0, step=1.0, label="Radial outer % (100=境界)")
                     rad_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
                 run_rad_btn = gr.Button("2. Build Radial mask")
                 rad_overlay = gr.Image(type="pil", label="Radial mask overlay", width=600)
-                rad_file = gr.File(label="Download radial mask (bool .npy)")
-                rad_lbl_file = gr.File(label="Download radial labels (.npy)")
+                # rad_npy_state = gr.File(label="Download radial mask (bool .npy)")
+                rad_npy_state = gr.State()
+                # rad_lbl_npy_stat = gr.File(label="Download radial labels (.npy)")
+                rad_lbl_npy_state = gr.State()
+                rad_tiff = gr.File(label="Download radial mask (TIFF)")
+                rad_lbl_tiff = gr.File(label="Download radial labels (label TIFF)")
+
                 use_radial_roi_tgt = gr.Checkbox(value=False, label="Use Radial ROI for Target mask")
                 use_radial_roi_ref = gr.Checkbox(value=False, label="Use Radial ROI for Reference mask")
 
@@ -605,7 +678,10 @@ def build_ui():
                     tgt_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
                 run_tgt_btn = gr.Button("3. Apply Target mask")
                 tgt_overlay = gr.Image(type="pil", label="Target mask overlay",width=600)
-                tgt_file = gr.File(label="Download target mask (.npy)")
+                # tgt_npy_state = gr.File(label="Download target mask (.npy)")
+                tgt_npy_state = gr.State()
+                tgt_tiff = gr.File(label="Download target mask (TIFF)")
+                
 
                 with gr.Accordion("Reference mask", open=False):
                     ref_chan = gr.Radio(["gray","R","G","B"], value="gray", label="Reference channel")
@@ -616,18 +692,27 @@ def build_ui():
                     ref_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
                 run_ref_btn = gr.Button("4. Apply Reference mask")
                 ref_overlay = gr.Image(type="pil", label="Reference mask overlay",width=600)
-                ref_file = gr.File(label="Download reference mask (.npy)")
+                # ref_npy_state = gr.File(label="Download reference mask (.npy)")
+                ref_npy_state = gr.State()
+                ref_tiff = gr.File(label="Download reference mask (TIFF)")
+                
 
                 integrate_btn = gr.Button("5. Integrate & Quantify")
+                # Pixel size inputs for ImageJ-compatible area (µm^2)
+                px_w = gr.Number(value=1.0, label="Pixel width (µm)")
+                px_h = gr.Number(value=1.0, label="Pixel height (µm)")
 
                 final_overlay = gr.Image(type="pil", label="Final overlay (AND mask)",width=600)
                 
-                mask_npy = gr.File(label="Download AND mask (.npy)")
+                # and_npy_state = gr.File(label="Download AND mask (.npy)")
+                and_npy_state = gr.State()
+                mask_tiff = gr.File(label="Download AND mask (TIFF)")
                 table = gr.Dataframe(label="Per-cell intensities & ratios", interactive=False)
                 csv_file = gr.File(label="Download CSV")
                 
                 ratio_img = gr.Image(type="pil", label="Ratio (Target/Reference) on AND mask", width=600)
-                ratio_npy = gr.File(label="Download ratio (T_over_R) (.npy)")
+                # ratio_npy_state = gr.File(label="Download ratio (T_over_R) (.npy)")                
+                ratio_npy_state = gr.State()
 
                 # Reset saved UI settings
                 reset_settings = gr.Button("Reset saved settings")
@@ -635,28 +720,28 @@ def build_ui():
         run_seg_btn.click(
             fn=run_segmentation,
             inputs=[tgt, ref, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu],
-            outputs=[seg_overlay, seg_file, mask_img, masks_state],
+            outputs=[seg_overlay, seg_npy_state, seg_tiff_file, mask_img, masks_state],
         )
         run_rad_btn.click(
             fn=radial_mask,
             inputs=[masks_state, rad_in, rad_out, rad_min_obj],
-            outputs=[rad_overlay, rad_file, radial_mask_state, rad_lbl_file, radial_label_state],
+            outputs=[rad_overlay, rad_npy_state, radial_mask_state, rad_lbl_npy_state, radial_label_state, rad_tiff, rad_lbl_tiff],
         )
         # Wrapper that passes ROI based on checkbox
         run_tgt_btn.click(
             fn=apply_mask_with_roi,
-            inputs=[tgt, masks_state, tgt_chan, tgt_sat_limit, tgt_mask_mode, tgt_pct, tgt_min_obj, use_radial_roi_tgt, radial_label_state],
-            outputs=[tgt_overlay, tgt_file, tgt_mask_state],
+            inputs=[tgt, masks_state, tgt_chan, tgt_sat_limit, tgt_mask_mode, tgt_pct, tgt_min_obj, use_radial_roi_tgt, radial_label_state, gr.State("target_mask")],
+            outputs=[tgt_overlay, tgt_npy_state, tgt_tiff, tgt_mask_state],
         )
         run_ref_btn.click(
             fn=apply_mask_with_roi,
-            inputs=[ref, masks_state, ref_chan, ref_sat_limit, ref_mask_mode, ref_pct, ref_min_obj, use_radial_roi_ref, radial_label_state],
-            outputs=[ref_overlay, ref_file, ref_mask_state],
+            inputs=[ref, masks_state, ref_chan, ref_sat_limit, ref_mask_mode, ref_pct, ref_min_obj, use_radial_roi_ref, radial_label_state, gr.State("reference_mask")],
+            outputs=[ref_overlay, ref_npy_state, ref_tiff, ref_mask_state],
         )
         integrate_btn.click(
             fn=integrate_and_quantify,
-            inputs=[tgt, ref, masks_state, tgt_mask_state, ref_mask_state, tgt_chan, ref_chan],
-            outputs=[final_overlay, mask_npy, table, csv_file, ratio_img, ratio_npy],
+            inputs=[tgt, ref, masks_state, tgt_mask_state, ref_mask_state, tgt_chan, ref_chan, px_w, px_h],
+            outputs=[final_overlay, and_npy_state, mask_tiff, table, csv_file, ratio_img, ratio_npy_state],
         )
 
         # -----------------------
@@ -674,6 +759,7 @@ def build_ui():
                 use_radial_roi_tgt, use_radial_roi_ref,
                 tgt_chan, tgt_mask_mode, tgt_sat_limit, tgt_pct, tgt_min_obj,
                 ref_chan, ref_mask_mode, ref_sat_limit, ref_pct, ref_min_obj,
+                px_w, px_h,
             ],
             js=f"""
             () => {{
@@ -686,6 +772,7 @@ def build_ui():
                         use_radial_roi_tgt: false, use_radial_roi_ref: false,
                         tgt_chan: 'gray', tgt_mask_mode: 'global_percentile', tgt_sat_limit: 254, tgt_pct: 75.0, tgt_min_obj: 50,
                         ref_chan: 'gray', ref_mask_mode: 'global_percentile', ref_sat_limit: 254, ref_pct: 75.0, ref_min_obj: 50,
+                        px_w: 1.0, px_h: 1.0,
                     }};
                     let s = raw ? {{...d, ...JSON.parse(raw)}} : d;
                     // Backward compatibility: map numeric channels to strings if needed
@@ -715,6 +802,8 @@ def build_ui():
                         s.ref_sat_limit,
                         s.ref_pct,
                         s.ref_min_obj,
+                        s.px_w,
+                        s.px_h,
                     ];
                 }} catch (e) {{
                     console.warn('Failed to load saved settings:', e);
@@ -725,6 +814,7 @@ def build_ui():
                         false, false,
                         'gray', 'global_percentile', 254, 75.0, 50,
                         'gray', 'global_percentile', 254, 75.0, 50,
+                        1.0, 1.0,
                     ];
                 }}
             }}
@@ -777,6 +867,9 @@ def build_ui():
         _persist_change(ref_sat_limit, 'ref_sat_limit')
         _persist_change(ref_pct, 'ref_pct')
         _persist_change(ref_min_obj, 'ref_min_obj')
+        # Persist pixel size settings
+        _persist_change(px_w, 'px_w')
+        _persist_change(px_h, 'px_h')
 
         # Reset button clears stored settings
         reset_settings.click(
@@ -788,6 +881,7 @@ def build_ui():
                 use_radial_roi_tgt, use_radial_roi_ref,
                 tgt_chan, tgt_mask_mode, tgt_sat_limit, tgt_pct, tgt_min_obj,
                 ref_chan, ref_mask_mode, ref_sat_limit, ref_pct, ref_min_obj,
+                px_w, px_h,
             ],
             js=f"""
             () => {{
@@ -803,6 +897,7 @@ def build_ui():
                     false, false,
                     'gray', 'global_percentile', 254, 75.0, 50,
                     'gray', 'global_percentile', 254, 75.0, 50,
+                    1.0, 1.0,
                 ];
             }}
             """,
