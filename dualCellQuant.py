@@ -341,11 +341,8 @@ def run_segmentation(
     overlay = annotate_ids(overlay, masks)
     mask_viz = vivid_label_image(masks)
 
-    tmp_npy = tempfile.NamedTemporaryFile(delete=False, suffix=".npy")
-    np.save(tmp_npy, masks)
-    tmp_npy.flush(); tmp_npy.close()
     seg_tiff = save_label_tiff(masks, "seg_labels")
-    return overlay, tmp_npy.name, seg_tiff, mask_viz, masks
+    return overlay, seg_tiff, mask_viz, masks
 
 # -----------------------
 # Step2: Radial mask step
@@ -416,15 +413,9 @@ def radial_mask(
     # 可視化
     overlay = colorize_overlay((masks>0).astype(np.float32), masks, radial_total)
     overlay = annotate_ids(overlay, masks)
-    tmp_bool = tempfile.NamedTemporaryFile(delete=False, suffix=".npy")
-    np.save(tmp_bool, radial_total)
-    tmp_bool.flush(); tmp_bool.close()
-    tmp_lbl = tempfile.NamedTemporaryFile(delete=False, suffix=".npy")
-    np.save(tmp_lbl, radial_labels)
-    tmp_lbl.flush(); tmp_lbl.close()
     rad_bool_tiff = save_bool_mask_tiff(radial_total, "radial_mask")
     rad_lbl_tiff = save_label_tiff(radial_labels, "radial_labels")
-    return overlay, tmp_bool.name, radial_total, tmp_lbl.name, radial_labels, rad_bool_tiff, rad_lbl_tiff
+    return overlay, radial_total, radial_labels, rad_bool_tiff, rad_lbl_tiff
 
 
 # -----------------------
@@ -460,20 +451,18 @@ def apply_mask(
 
     labels = np.unique(masks); labels = labels[labels > 0]
     for lab in labels:
-        cell = masks == lab
-        if roi_labels is not None:
-            # ROI が指定されている場合は、対応するラベル領域に限定
-            cell = cell & (roi_labels == lab)
+        # ROI が指定されている場合は ROI のラベル領域全体を基準にする（元セルとANDしない）
+        region = (roi_labels == lab) if roi_labels is not None else (masks == lab)
         if mask_mode == "none":
             # Noneでも Saturation limit は適用
-            mask_cell = cell & nonsat
+            mask_cell = region & nonsat
         elif mask_mode in ("global_otsu", "global_percentile"):
-            mask_cell = global_mask & cell
+            mask_cell = global_mask & region
             mask_cell = cleanup_mask(mask_cell, int(min_obj_size))
         elif mask_mode in ("per_cell_otsu", "per_cell_percentile"):
-            pool = gray[cell & nonsat]
+            pool = gray[region & nonsat]
             th = per_cell_threshold(pool, mask_mode, float(pct))
-            base = (gray >= th) & nonsat & cell if not np.isnan(th) else np.zeros_like(cell, dtype=bool)
+            base = (gray >= th) & nonsat & region if not np.isnan(th) else np.zeros_like(region, dtype=bool)
             mask_cell = cleanup_mask(base, int(min_obj_size))
         else:
             raise ValueError("Invalid mask_mode")
@@ -482,11 +471,8 @@ def apply_mask(
     overlay = colorize_overlay(gray, masks, mask_total)
     overlay = annotate_ids(overlay, masks)
 
-    tmp_npy = tempfile.NamedTemporaryFile(delete=False, suffix=".npy")
-    np.save(tmp_npy, mask_total)
-    tmp_npy.flush(); tmp_npy.close()
     tiff_path = save_bool_mask_tiff(mask_total, mask_name)
-    return overlay, tmp_npy.name, tiff_path, mask_total
+    return overlay, tiff_path, mask_total
 
 # -----------------------
 # Helper: apply mask with optional ROI toggle
@@ -615,10 +601,16 @@ def integrate_and_quantify(
     overlay = annotate_ids(overlay, masks)
    
 
-    tmp_npy = tempfile.NamedTemporaryFile(delete=False, suffix=".npy")
-    np.save(tmp_npy, and_mask)
-    tmp_npy.flush(); tmp_npy.close()
     and_tiff = save_bool_mask_tiff(and_mask, "and_mask")
+
+    # --- Target on AND mask ---
+    # 可視化は0-1の vis 配列を使用
+    tgt_on_and = np.where(and_mask, tgt_gray_vis, 0.0)
+    tgt_on_and_img = Image.fromarray((np.clip(tgt_on_and, 0, 1) * 255).astype(np.uint8))
+
+    # --- Reference on AND mask ---
+    ref_on_and = np.where(and_mask, ref_gray_vis, 0.0)
+    ref_on_and_img = Image.fromarray((np.clip(ref_on_and, 0, 1) * 255).astype(np.uint8))
 
     # --- 比率画像の生成（T/R） ---
     # refが0のところはNaNにして割り算回避
@@ -647,11 +639,7 @@ def integrate_and_quantify(
 
 
     # 生の比率配列を保存（NaN含む）
-    tmp_ratio_npy = tempfile.NamedTemporaryFile(delete=False, suffix=".npy")
-    np.save(tmp_ratio_npy, ratio_img)
-    tmp_ratio_npy.flush(); tmp_ratio_npy.close()
-
-    return overlay, tmp_npy.name, and_tiff, df, tmp_csv.name, ratio_overlay, tmp_ratio_npy.name
+    return overlay, and_tiff, df, tmp_csv.name, tgt_on_and_img, ref_on_and_img, ratio_overlay
 
 
 # -----------------------
@@ -759,6 +747,8 @@ def build_ui():
                 table = gr.Dataframe(label="Per-cell intensities & ratios", interactive=False)
                 csv_file = gr.File(label="Download CSV")
                 
+                tgt_on_and_img = gr.Image(type="pil", label="Target on AND mask", width=600)
+                ref_on_and_img = gr.Image(type="pil", label="Reference on AND mask", width=600)
                 ratio_img = gr.Image(type="pil", label="Ratio (Target/Reference) on AND mask", width=600)
                 # ratio_npy_state = gr.File(label="Download ratio (T_over_R) (.npy)")                
                 ratio_npy_state = gr.State()
@@ -769,28 +759,28 @@ def build_ui():
         run_seg_btn.click(
             fn=run_segmentation,
             inputs=[tgt, ref, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu],
-            outputs=[seg_overlay, seg_npy_state, seg_tiff_file, mask_img, masks_state],
+            outputs=[seg_overlay, seg_tiff_file, mask_img, masks_state],
         )
         run_rad_btn.click(
             fn=radial_mask,
             inputs=[masks_state, rad_in, rad_out, rad_min_obj],
-            outputs=[rad_overlay, rad_npy_state, radial_mask_state, rad_lbl_npy_state, radial_label_state, rad_tiff, rad_lbl_tiff],
+            outputs=[rad_overlay, radial_mask_state, radial_label_state, rad_tiff, rad_lbl_tiff],
         )
         # Wrapper that passes ROI based on checkbox
         run_tgt_btn.click(
             fn=apply_mask_with_roi,
             inputs=[tgt, masks_state, tgt_chan, tgt_sat_limit, tgt_mask_mode, tgt_pct, tgt_min_obj, use_radial_roi_tgt, radial_label_state, gr.State("target_mask")],
-            outputs=[tgt_overlay, tgt_npy_state, tgt_tiff, tgt_mask_state],
+            outputs=[tgt_overlay, tgt_tiff, tgt_mask_state],
         )
         run_ref_btn.click(
             fn=apply_mask_with_roi,
             inputs=[ref, masks_state, ref_chan, ref_sat_limit, ref_mask_mode, ref_pct, ref_min_obj, use_radial_roi_ref, radial_label_state, gr.State("reference_mask")],
-            outputs=[ref_overlay, ref_npy_state, ref_tiff, ref_mask_state],
+            outputs=[ref_overlay, ref_tiff, ref_mask_state],
         )
         integrate_btn.click(
             fn=integrate_and_quantify,
             inputs=[tgt, ref, masks_state, tgt_mask_state, ref_mask_state, tgt_chan, ref_chan, px_w, px_h],
-            outputs=[final_overlay, and_npy_state, mask_tiff, table, csv_file, ratio_img, ratio_npy_state],
+            outputs=[final_overlay, mask_tiff, table, csv_file, tgt_on_and_img, ref_on_and_img, ratio_img],
         )
 
         # -----------------------
