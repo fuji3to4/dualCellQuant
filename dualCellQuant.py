@@ -682,6 +682,9 @@ def build_ui():
             with gr.Column():
                 tgt = gr.Image(type="pil", label="Target image", image_mode="RGB", width=600)
                 ref = gr.Image(type="pil", label="Reference image", image_mode="RGB", width=600)
+                
+                # Label size control (helpful for Linux servers)
+                label_scale = gr.Slider(0.0, 5.0, value=float(LABEL_SCALE), step=0.1, label="Label size scale (0=hidden)")
 
                 with gr.Accordion("Segmentation params", open=False):
                     seg_source = gr.Radio(["target","reference"], value="target", label="Segment on")
@@ -747,8 +750,6 @@ def build_ui():
                 px_w = gr.Number(value=1.0, label="Pixel width (µm)")
                 px_h = gr.Number(value=1.0, label="Pixel height (µm)")
 
-                # Label size control (helpful for Linux servers)
-                label_scale = gr.Slider(0.0, 5.0, value=float(LABEL_SCALE), step=0.1, label="Label size scale (0=hidden)")
 
                 final_overlay = gr.Image(type="pil", label="Final overlay (AND mask)",width=600)
                 
