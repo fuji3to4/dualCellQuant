@@ -228,6 +228,12 @@ def vivid_label_image(masks: np.ndarray) -> Image.Image:
 
 
 def annotate_ids(img: Image.Image, masks: np.ndarray) -> Image.Image:
+    # If label scale is zero or negative, skip drawing labels
+    try:
+        if float(LABEL_SCALE) <= 0.0:
+            return img
+    except Exception:
+        pass
     draw = ImageDraw.Draw(img)
     w, h = img.size
     # Larger, more legible font size with scalable factor
@@ -742,7 +748,7 @@ def build_ui():
                 px_h = gr.Number(value=1.0, label="Pixel height (µm)")
 
                 # Label size control (helpful for Linux servers)
-                label_scale = gr.Slider(0.5, 5.0, value=float(LABEL_SCALE), step=0.1, label="Label size scale")
+                label_scale = gr.Slider(0.0, 5.0, value=float(LABEL_SCALE), step=0.1, label="Label size scale (0=hidden)")
 
                 final_overlay = gr.Image(type="pil", label="Final overlay (AND mask)",width=600)
                 
