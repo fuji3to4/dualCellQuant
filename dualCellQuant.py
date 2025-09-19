@@ -594,6 +594,9 @@ def integrate_and_quantify(
         })
 
     df = pd.DataFrame(rows).sort_values("label")
+    # 表示用は左端に label を常時表示できるように index 化
+    df_display = df.set_index("label")
+    # CSV は従来通り label を列として保持
     tmp_csv = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
     df.to_csv(tmp_csv.name, index=False)
 
@@ -639,7 +642,7 @@ def integrate_and_quantify(
 
 
     # 生の比率配列を保存（NaN含む）
-    return overlay, and_tiff, df, tmp_csv.name, tgt_on_and_img, ref_on_and_img, ratio_overlay
+    return overlay, and_tiff, df_display, tmp_csv.name, tgt_on_and_img, ref_on_and_img, ratio_overlay
 
 
 # -----------------------
