@@ -650,318 +650,595 @@ def integrate_and_quantify(
 # UI
 # -----------------------
 
+def run_segmentation_single(
+    image: Image.Image,
+    seg_channel: int | str,
+    diameter: float,
+    flow_threshold: float,
+    cellprob_threshold: float,
+    use_gpu: bool,
+):
+    arr = pil_to_numpy(image)
+    gray = extract_single_channel(arr, seg_channel)
+    model = get_model(use_gpu)
+    result = model.eval(
+        gray,
+        diameter=None if diameter <= 0 else diameter,
+        flow_threshold=flow_threshold,
+        cellprob_threshold=cellprob_threshold,
+        channels=[0, 0],
+        normalize=True,
+        invert=False,
+        compute_masks=True,
+        progress=None,
+    )
+    if isinstance(result, tuple) and len(result) == 4:
+        masks, flows, styles, diams = result
+    elif isinstance(result, tuple) and len(result) == 3:
+        masks, flows, styles = result
+    else:
+        raise ValueError("Unexpected return values from model.eval")
+
+    overlay = colorize_overlay(gray, masks, None)
+    overlay = annotate_ids(overlay, masks)
+    mask_viz = vivid_label_image(masks)
+    seg_tiff = save_label_tiff(masks, "seg_labels")
+    return overlay, seg_tiff, mask_viz, masks
+
+
+def integrate_and_quantify_single(
+    image: Image.Image,
+    masks: np.ndarray,
+    mask_bool: np.ndarray,
+    chan: int | str,
+    pixel_width_um: float,
+    pixel_height_um: float,
+):
+    if masks is None or mask_bool is None:
+        raise ValueError("Run previous steps first.")
+
+    # Visualization array (0-1) and native array (original scale)
+    vis = pil_to_numpy(image)
+    nat = pil_to_numpy_native(image)
+    gray_vis = extract_single_channel(vis, chan)
+    gray_nat = extract_single_channel(nat, chan)
+
+    labels = np.unique(masks); labels = labels[labels > 0]
+    # Area conversion (um^2 per pixel)
+    try:
+        px_area_um2 = float(pixel_width_um) * float(pixel_height_um)
+    except Exception:
+        px_area_um2 = 1.0
+
+    rows = []
+    for lab in labels:
+        cell = masks == lab
+        idx = mask_bool & cell
+        area_cell_px = int(cell.sum())
+        area_mask_px = int(idx.sum())
+        area_cell_um2 = float(area_cell_px) * px_area_um2
+        area_mask_um2 = float(area_mask_px) * px_area_um2
+        if area_mask_px == 0:
+            mean_on = std_on = sum_on = np.nan
+        else:
+            mean_on = float(np.mean(gray_nat[idx]))
+            std_on = float(np.std(gray_nat[idx]))
+            sum_on = float(np.sum(gray_nat[idx]))
+        # Whole-cell stats (native scale)
+        if area_cell_px == 0:
+            mean_whole = std_whole = sum_whole = np.nan
+        else:
+            mean_whole = float(np.mean(gray_nat[cell]))
+            std_whole = float(np.std(gray_nat[cell]))
+            sum_whole = float(np.sum(gray_nat[cell]))
+        rows.append({
+            "label": int(lab),
+            "area_cell_px": area_cell_px,
+            "area_cell_um2": area_cell_um2,
+            "area_mask_px": area_mask_px,
+            "area_mask_um2": area_mask_um2,
+            "sum_on_mask": sum_on,
+            "mean_on_mask": mean_on,
+            "std_on_mask": std_on,
+            "sum_whole": sum_whole,
+            "mean_whole": mean_whole,
+            "std_whole": std_whole,
+        })
+
+    df = pd.DataFrame(rows).sort_values("label")
+    if "label" in df.columns:
+        df = df[["label"] + [c for c in df.columns if c != "label"]]
+    tmp_csv = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
+    df.to_csv(tmp_csv.name, index=False)
+
+    overlay = colorize_overlay(gray_vis, masks, mask_bool)
+    overlay = annotate_ids(overlay, masks)
+    mask_tiff = save_bool_mask_tiff(mask_bool, "mask")
+
+    # Image on mask visualization (0-1 range for display)
+    img_on_mask = np.where(mask_bool, gray_vis, 0.0)
+    img_on_mask = Image.fromarray((np.clip(img_on_mask, 0, 1) * 255).astype(np.uint8))
+
+    return overlay, mask_tiff, df, tmp_csv.name, img_on_mask
+
+
 def build_ui():
     with gr.Blocks(title="DualCellQuant") as demo:
         gr.Markdown(
             """
             # 🔬 **DualCellQuant**
-            *Segment, filter, and compare cells across two fluorescence channels*
-            1. **Run Cellpose-SAM** to obtain segmentation masks.
-            2. **Build Radial mask** (optional).
-            3. **Apply Target mask** conditions.
-            4. **Apply Reference mask** conditions.
-            5. **Integrate** Target & Reference masks and view results.
-            Each step can be rerun to tune parameters before integration.
+            - 2画像比較用と1画像用の2つのタブを用意しました。
+            - Single Image: Cellpose-SAM → (optional) Radial mask → Mask → Quantification
+            - Dual Images: 既存の2画像パイプライン（ターゲット/リファレンス、ANDマスク、比率など）
             """
         )
-        masks_state = gr.State()
-        radial_mask_state = gr.State()           # bool mask
-        radial_label_state = gr.State()          # labeled mask
-        tgt_mask_state = gr.State()
-        ref_mask_state = gr.State()
-        
-        with gr.Row():
-            with gr.Column():
-                tgt = gr.Image(type="pil", label="Target image", image_mode="RGB", width=600)
-                ref = gr.Image(type="pil", label="Reference image", image_mode="RGB", width=600)
-                
-                # Label size control (helpful for Linux servers)
-                label_scale = gr.Slider(0.0, 5.0, value=float(LABEL_SCALE), step=0.1, label="Label size scale (0=hidden)")
 
-                with gr.Accordion("Segmentation params", open=False):
-                    seg_source = gr.Radio(["target","reference"], value="target", label="Segment on")
-                    seg_chan = gr.Radio(["gray","R","G","B"], value="gray", label="Segmentation channel")
-                    diameter = gr.Slider(0, 200, value=0, step=1, label="Diameter (px, 0=auto)")
-                    flow_th = gr.Slider(0.0, 1.5, value=0.4, step=0.05, label="Flow threshold")
-                    cellprob_th = gr.Slider(-6.0, 6.0, value=0.0, step=0.1, label="Cellprob threshold")
-                    use_gpu = gr.Checkbox(value=True, label="Use GPU if available")
-                run_seg_btn = gr.Button("1. Run Cellpose")
-                seg_overlay = gr.Image(type="pil", label="Segmentation overlay",width=600)
-                mask_img = gr.Image(type="pil", label="Segmentation label image",width=600)
-                # seg_npy_state = gr.File(label="Download masks (.npy)")
-                seg_npy_state = gr.State()
-                seg_tiff_file = gr.File(label="Download masks (label TIFF)")
-                # Hidden holders to capture .npy paths without showing download widgets
-                
-                with gr.Accordion("Radial mask (optional)", open=False):
-                    rad_in = gr.Slider(0.0, 120.0, value=0.0, step=1.0, label="Radial inner % (0=中心)")
-                    rad_out = gr.Slider(0.0, 120.0, value=100.0, step=1.0, label="Radial outer % (100=境界)")
-                    rad_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
-                run_rad_btn = gr.Button("2. Build Radial mask")
-                rad_overlay = gr.Image(type="pil", label="Radial mask overlay", width=600)
-                # rad_npy_state = gr.File(label="Download radial mask (bool .npy)")
-                rad_npy_state = gr.State()
-                # rad_lbl_npy_stat = gr.File(label="Download radial labels (.npy)")
-                rad_lbl_npy_state = gr.State()
-                rad_tiff = gr.File(label="Download radial mask (TIFF)")
-                rad_lbl_tiff = gr.File(label="Download radial labels (label TIFF)")
+        with gr.Tabs():
+            # ---------------- Dual images tab (existing UI) ----------------
+            with gr.TabItem("Dual images"):
+                masks_state = gr.State()
+                radial_mask_state = gr.State()           # bool mask
+                radial_label_state = gr.State()          # labeled mask
+                tgt_mask_state = gr.State()
+                ref_mask_state = gr.State()
 
-                use_radial_roi_tgt = gr.Checkbox(value=False, label="Use Radial ROI for Target mask")
-                use_radial_roi_ref = gr.Checkbox(value=False, label="Use Radial ROI for Reference mask")
+                with gr.Row():
+                    with gr.Column():
+                        tgt = gr.Image(type="pil", label="Target image", image_mode="RGB", width=600)
+                        ref = gr.Image(type="pil", label="Reference image", image_mode="RGB", width=600)
 
-                with gr.Accordion("Target mask", open=False):
-                    tgt_chan = gr.Radio(["gray","R","G","B"], value="gray", label="Target channel")
-                    tgt_mask_mode = gr.Radio(["none","global_percentile","global_otsu","per_cell_percentile","per_cell_otsu"], value="global_percentile", label="Masking mode")
-                    # 8bit絶対値（0-255）指定に変更
-                    tgt_sat_limit = gr.Slider(0, 255, value=254, step=1, label="Saturation limit (abs, 8-bit scale)")
-                    tgt_pct = gr.Slider(0.0, 100.0, value=75.0, step=1.0, label="Percentile (Top p%)")
-                    tgt_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
-                run_tgt_btn = gr.Button("3. Apply Target mask")
-                tgt_overlay = gr.Image(type="pil", label="Target mask overlay",width=600)
-                # tgt_npy_state = gr.File(label="Download target mask (.npy)")
-                tgt_npy_state = gr.State()
-                tgt_tiff = gr.File(label="Download target mask (TIFF)")
-                
+                        # Label size control (helpful for Linux servers)
+                        label_scale = gr.Slider(0.0, 5.0, value=float(LABEL_SCALE), step=0.1, label="Label size scale (0=hidden)")
 
-                with gr.Accordion("Reference mask", open=False):
-                    ref_chan = gr.Radio(["gray","R","G","B"], value="gray", label="Reference channel")
-                    ref_mask_mode = gr.Radio(["none","global_percentile","global_otsu","per_cell_percentile","per_cell_otsu"], value="global_percentile", label="Masking mode")
-                    # 8bit絶対値（0-255）指定に変更
-                    ref_sat_limit = gr.Slider(0, 255, value=254, step=1, label="Saturation limit (abs, 8-bit scale)")
-                    ref_pct = gr.Slider(0.0, 100.0, value=75.0, step=1.0, label="Percentile (Top p%)")
-                    ref_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
-                run_ref_btn = gr.Button("4. Apply Reference mask")
-                ref_overlay = gr.Image(type="pil", label="Reference mask overlay",width=600)
-                # ref_npy_state = gr.File(label="Download reference mask (.npy)")
-                ref_npy_state = gr.State()
-                ref_tiff = gr.File(label="Download reference mask (TIFF)")
-                
+                        with gr.Accordion("Segmentation params", open=False):
+                            seg_source = gr.Radio(["target","reference"], value="target", label="Segment on")
+                            seg_chan = gr.Radio(["gray","R","G","B"], value="gray", label="Segmentation channel")
+                            diameter = gr.Slider(0, 200, value=0, step=1, label="Diameter (px, 0=auto)")
+                            flow_th = gr.Slider(0.0, 1.5, value=0.4, step=0.05, label="Flow threshold")
+                            cellprob_th = gr.Slider(-6.0, 6.0, value=0.0, step=0.1, label="Cellprob threshold")
+                            use_gpu = gr.Checkbox(value=True, label="Use GPU if available")
+                        run_seg_btn = gr.Button("1. Run Cellpose")
+                        seg_overlay = gr.Image(type="pil", label="Segmentation overlay",width=600)
+                        mask_img = gr.Image(type="pil", label="Segmentation label image",width=600)
+                        seg_npy_state = gr.State()
+                        seg_tiff_file = gr.File(label="Download masks (label TIFF)")
 
-                integrate_btn = gr.Button("5. Integrate & Quantify")
-                # Pixel size inputs for ImageJ-compatible area (µm^2)
-                px_w = gr.Number(value=1.0, label="Pixel width (µm)")
-                px_h = gr.Number(value=1.0, label="Pixel height (µm)")
+                        with gr.Accordion("Radial mask (optional)", open=False):
+                            rad_in = gr.Slider(0.0, 120.0, value=0.0, step=1.0, label="Radial inner % (0=中心)")
+                            rad_out = gr.Slider(0.0, 120.0, value=100.0, step=1.0, label="Radial outer % (100=境界)")
+                            rad_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
+                        run_rad_btn = gr.Button("2. Build Radial mask")
+                        rad_overlay = gr.Image(type="pil", label="Radial mask overlay", width=600)
+                        rad_npy_state = gr.State()
+                        rad_lbl_npy_state = gr.State()
+                        rad_tiff = gr.File(label="Download radial mask (TIFF)")
+                        rad_lbl_tiff = gr.File(label="Download radial labels (label TIFF)")
 
+                        use_radial_roi_tgt = gr.Checkbox(value=False, label="Use Radial ROI for Target mask")
+                        use_radial_roi_ref = gr.Checkbox(value=False, label="Use Radial ROI for Reference mask")
 
-                final_overlay = gr.Image(type="pil", label="Final overlay (AND mask)",width=600)
-                
-                # and_npy_state = gr.File(label="Download AND mask (.npy)")
-                and_npy_state = gr.State()
-                mask_tiff = gr.File(label="Download AND mask (TIFF)")
-                table = gr.Dataframe(label="Per-cell intensities & ratios", interactive=False,pinned_columns=1)
-                csv_file = gr.File(label="Download CSV")
-                
-                tgt_on_and_img = gr.Image(type="pil", label="Target on AND mask", width=600)
-                ref_on_and_img = gr.Image(type="pil", label="Reference on AND mask", width=600)
-                ratio_img = gr.Image(type="pil", label="Ratio (Target/Reference) on AND mask", width=600)
-                # ratio_npy_state = gr.File(label="Download ratio (T_over_R) (.npy)")                
-                ratio_npy_state = gr.State()
+                        with gr.Accordion("Target mask", open=False):
+                            tgt_chan = gr.Radio(["gray","R","G","B"], value="gray", label="Target channel")
+                            tgt_mask_mode = gr.Radio(["none","global_percentile","global_otsu","per_cell_percentile","per_cell_otsu"], value="global_percentile", label="Masking mode")
+                            tgt_sat_limit = gr.Slider(0, 255, value=254, step=1, label="Saturation limit (abs, 8-bit scale)")
+                            tgt_pct = gr.Slider(0.0, 100.0, value=75.0, step=1.0, label="Percentile (Top p%)")
+                            tgt_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
+                        run_tgt_btn = gr.Button("3. Apply Target mask")
+                        tgt_overlay = gr.Image(type="pil", label="Target mask overlay",width=600)
+                        tgt_npy_state = gr.State()
+                        tgt_tiff = gr.File(label="Download target mask (TIFF)")
 
-                # Reset saved UI settings
-                reset_settings = gr.Button("Reset saved settings")
+                        with gr.Accordion("Reference mask", open=False):
+                            ref_chan = gr.Radio(["gray","R","G","B"], value="gray", label="Reference channel")
+                            ref_mask_mode = gr.Radio(["none","global_percentile","global_otsu","per_cell_percentile","per_cell_otsu"], value="global_percentile", label="Masking mode")
+                            ref_sat_limit = gr.Slider(0, 255, value=254, step=1, label="Saturation limit (abs, 8-bit scale)")
+                            ref_pct = gr.Slider(0.0, 100.0, value=75.0, step=1.0, label="Percentile (Top p%)")
+                            ref_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
+                        run_ref_btn = gr.Button("4. Apply Reference mask")
+                        ref_overlay = gr.Image(type="pil", label="Reference mask overlay",width=600)
+                        ref_npy_state = gr.State()
+                        ref_tiff = gr.File(label="Download reference mask (TIFF)")
 
-        run_seg_btn.click(
-            fn=run_segmentation,
-            inputs=[tgt, ref, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu],
-            outputs=[seg_overlay, seg_tiff_file, mask_img, masks_state],
-        )
-        run_rad_btn.click(
-            fn=radial_mask,
-            inputs=[masks_state, rad_in, rad_out, rad_min_obj],
-            outputs=[rad_overlay, radial_mask_state, radial_label_state, rad_tiff, rad_lbl_tiff],
-        )
-        # Wrapper that passes ROI based on checkbox
-        run_tgt_btn.click(
-            fn=apply_mask_with_roi,
-            inputs=[tgt, masks_state, tgt_chan, tgt_sat_limit, tgt_mask_mode, tgt_pct, tgt_min_obj, use_radial_roi_tgt, radial_label_state, gr.State("target_mask")],
-            outputs=[tgt_overlay, tgt_tiff, tgt_mask_state],
-        )
-        run_ref_btn.click(
-            fn=apply_mask_with_roi,
-            inputs=[ref, masks_state, ref_chan, ref_sat_limit, ref_mask_mode, ref_pct, ref_min_obj, use_radial_roi_ref, radial_label_state, gr.State("reference_mask")],
-            outputs=[ref_overlay, ref_tiff, ref_mask_state],
-        )
-        integrate_btn.click(
-            fn=integrate_and_quantify,
-            inputs=[tgt, ref, masks_state, tgt_mask_state, ref_mask_state, tgt_chan, ref_chan, px_w, px_h],
-            outputs=[final_overlay, mask_tiff, table, csv_file, tgt_on_and_img, ref_on_and_img, ratio_img],
-        )
+                        integrate_btn = gr.Button("5. Integrate & Quantify")
+                        px_w = gr.Number(value=1.0, label="Pixel width (µm)")
+                        px_h = gr.Number(value=1.0, label="Pixel height (µm)")
 
-        # -----------------------
-        # Persist UI settings in browser localStorage
-        # -----------------------
-        SETTINGS_KEY = "dcq_settings_v1"
+                        final_overlay = gr.Image(type="pil", label="Final overlay (AND mask)",width=600)
+                        and_npy_state = gr.State()
+                        mask_tiff = gr.File(label="Download AND mask (TIFF)")
+                        table = gr.Dataframe(label="Per-cell intensities & ratios", interactive=False,pinned_columns=1)
+                        csv_file = gr.File(label="Download CSV")
 
-        # Restore saved settings on app load
-        demo.load(
-            fn=None,
-            inputs=[],
-            outputs=[
-                seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu,
-                rad_in, rad_out, rad_min_obj,
-                use_radial_roi_tgt, use_radial_roi_ref,
-                tgt_chan, tgt_mask_mode, tgt_sat_limit, tgt_pct, tgt_min_obj,
-                ref_chan, ref_mask_mode, ref_sat_limit, ref_pct, ref_min_obj,
-                px_w, px_h,
-                label_scale,
-            ],
-            js=f"""
-            () => {{
-                try {{
-                    const raw = localStorage.getItem('{SETTINGS_KEY}');
-                    // Defaults aligned with component value= in Python UI
-                    const d = {{
-                        seg_source: 'target', seg_chan: 'gray', diameter: 0, flow_th: 0.4, cellprob_th: 0.0, use_gpu: true,
-                        rad_in: 0.0, rad_out: 100.0, rad_min_obj: 50,
-                        use_radial_roi_tgt: false, use_radial_roi_ref: false,
-                        tgt_chan: 'gray', tgt_mask_mode: 'global_percentile', tgt_sat_limit: 254, tgt_pct: 75.0, tgt_min_obj: 50,
-                        ref_chan: 'gray', ref_mask_mode: 'global_percentile', ref_sat_limit: 254, ref_pct: 75.0, ref_min_obj: 50,
-                        px_w: 1.0, px_h: 1.0,
-                        label_scale: {float(LABEL_SCALE)},
-                    }};
-                    let s = raw ? {{...d, ...JSON.parse(raw)}} : d;
-                    // Backward compatibility: map numeric channels to strings if needed
-                    const mapChan = (v) => ({{0:'gray',1:'R',2:'G',3:'B'}})[v] ?? v;
-                    s.seg_chan = mapChan(s.seg_chan);
-                    s.tgt_chan = mapChan(s.tgt_chan);
-                    s.ref_chan = mapChan(s.ref_chan);
-                    return [
-                        s.seg_source,
-                        s.seg_chan,
-                        s.diameter,
-                        s.flow_th,
-                        s.cellprob_th,
-                        s.use_gpu,
-                        s.rad_in,
-                        s.rad_out,
-                        s.rad_min_obj,
-                        s.use_radial_roi_tgt,
-                        s.use_radial_roi_ref,
-                        s.tgt_chan,
-                        s.tgt_mask_mode,
-                        s.tgt_sat_limit,
-                        s.tgt_pct,
-                        s.tgt_min_obj,
-                        s.ref_chan,
-                        s.ref_mask_mode,
-                        s.ref_sat_limit,
-                        s.ref_pct,
-                        s.ref_min_obj,
-                        s.px_w,
-                        s.px_h,
-                        s.label_scale,
-                    ];
-                }} catch (e) {{
-                    console.warn('Failed to load saved settings:', e);
-                    // Fallback to defaults if parsing/storage fails
-                    return [
-                        'target', 'gray', 0, 0.4, 0.0, true,
-                        0.0, 100.0, 50,
-                        false, false,
-                        'gray', 'global_percentile', 254, 75.0, 50,
-                        'gray', 'global_percentile', 254, 75.0, 50,
-                        1.0, 1.0,
-                        {float(LABEL_SCALE)},
-                    ];
-                }}
-            }}
-            """,
-        )
+                        tgt_on_and_img = gr.Image(type="pil", label="Target on AND mask", width=600)
+                        ref_on_and_img = gr.Image(type="pil", label="Reference on AND mask", width=600)
+                        ratio_img = gr.Image(type="pil", label="Ratio (Target/Reference) on AND mask", width=600)
+                        ratio_npy_state = gr.State()
 
-        # Helper to register change->save for a component key
-        def _persist_change(comp, key: str):
-            comp.change(
-                fn=None,
-                inputs=[comp],
-                outputs=[],
-                js=f"""
-                (v) => {{
-                    try {{
-                        const k = '{SETTINGS_KEY}';
-                        const raw = localStorage.getItem(k);
-                        const s = raw ? JSON.parse(raw) : {{}};
-                        s['{key}'] = v;
-                        localStorage.setItem(k, JSON.stringify(s));
-                    }} catch (e) {{
-                        console.warn('Failed to save setting {key}:', e);
+                        reset_settings = gr.Button("Reset saved settings")
+
+                run_seg_btn.click(
+                    fn=run_segmentation,
+                    inputs=[tgt, ref, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu],
+                    outputs=[seg_overlay, seg_tiff_file, mask_img, masks_state],
+                )
+                run_rad_btn.click(
+                    fn=radial_mask,
+                    inputs=[masks_state, rad_in, rad_out, rad_min_obj],
+                    outputs=[rad_overlay, radial_mask_state, radial_label_state, rad_tiff, rad_lbl_tiff],
+                )
+                run_tgt_btn.click(
+                    fn=apply_mask_with_roi,
+                    inputs=[tgt, masks_state, tgt_chan, tgt_sat_limit, tgt_mask_mode, tgt_pct, tgt_min_obj, use_radial_roi_tgt, radial_label_state, gr.State("target_mask")],
+                    outputs=[tgt_overlay, tgt_tiff, tgt_mask_state],
+                )
+                run_ref_btn.click(
+                    fn=apply_mask_with_roi,
+                    inputs=[ref, masks_state, ref_chan, ref_sat_limit, ref_mask_mode, ref_pct, ref_min_obj, use_radial_roi_ref, radial_label_state, gr.State("reference_mask")],
+                    outputs=[ref_overlay, ref_tiff, ref_mask_state],
+                )
+                integrate_btn.click(
+                    fn=integrate_and_quantify,
+                    inputs=[tgt, ref, masks_state, tgt_mask_state, ref_mask_state, tgt_chan, ref_chan, px_w, px_h],
+                    outputs=[final_overlay, mask_tiff, table, csv_file, tgt_on_and_img, ref_on_and_img, ratio_img],
+                )
+
+                # ---------------- Persist settings (Dual) ----------------
+                SETTINGS_KEY = "dcq_settings_v1"
+                demo.load(
+                    fn=None,
+                    inputs=[],
+                    outputs=[
+                        seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu,
+                        rad_in, rad_out, rad_min_obj,
+                        use_radial_roi_tgt, use_radial_roi_ref,
+                        tgt_chan, tgt_mask_mode, tgt_sat_limit, tgt_pct, tgt_min_obj,
+                        ref_chan, ref_mask_mode, ref_sat_limit, ref_pct, ref_min_obj,
+                        px_w, px_h,
+                        label_scale,
+                    ],
+                    js=f"""
+                    () => {{
+                        try {{
+                            const raw = localStorage.getItem('{SETTINGS_KEY}');
+                            const d = {{
+                                seg_source: 'target', seg_chan: 'gray', diameter: 0, flow_th: 0.4, cellprob_th: 0.0, use_gpu: true,
+                                rad_in: 0.0, rad_out: 100.0, rad_min_obj: 50,
+                                use_radial_roi_tgt: false, use_radial_roi_ref: false,
+                                tgt_chan: 'gray', tgt_mask_mode: 'global_percentile', tgt_sat_limit: 254, tgt_pct: 75.0, tgt_min_obj: 50,
+                                ref_chan: 'gray', ref_mask_mode: 'global_percentile', ref_sat_limit: 254, ref_pct: 75.0, ref_min_obj: 50,
+                                px_w: 1.0, px_h: 1.0,
+                                label_scale: {float(LABEL_SCALE)},
+                            }};
+                            let s = raw ? {{...d, ...JSON.parse(raw)}} : d;
+                            const mapChan = (v) => ({{0:'gray',1:'R',2:'G',3:'B'}})[v] ?? v;
+                            s.seg_chan = mapChan(s.seg_chan);
+                            s.tgt_chan = mapChan(s.tgt_chan);
+                            s.ref_chan = mapChan(s.ref_chan);
+                            return [
+                                s.seg_source,
+                                s.seg_chan,
+                                s.diameter,
+                                s.flow_th,
+                                s.cellprob_th,
+                                s.use_gpu,
+                                s.rad_in,
+                                s.rad_out,
+                                s.rad_min_obj,
+                                s.use_radial_roi_tgt,
+                                s.use_radial_roi_ref,
+                                s.tgt_chan,
+                                s.tgt_mask_mode,
+                                s.tgt_sat_limit,
+                                s.tgt_pct,
+                                s.tgt_min_obj,
+                                s.ref_chan,
+                                s.ref_mask_mode,
+                                s.ref_sat_limit,
+                                s.ref_pct,
+                                s.ref_min_obj,
+                                s.px_w,
+                                s.px_h,
+                                s.label_scale,
+                            ];
+                        }} catch (e) {{
+                            console.warn('Failed to load saved settings:', e);
+                            return [
+                                'target', 'gray', 0, 0.4, 0.0, true,
+                                0.0, 100.0, 50,
+                                false, false,
+                                'gray', 'global_percentile', 254, 75.0, 50,
+                                'gray', 'global_percentile', 254, 75.0, 50,
+                                1.0, 1.0,
+                                {float(LABEL_SCALE)},
+                            ];
+                        }}
                     }}
-                }}
-                """,
-            )
+                    """,
+                )
 
-        # Register persistence for target/reference and segmentation params
-        _persist_change(seg_source, 'seg_source')
-        _persist_change(seg_chan, 'seg_chan')
-        _persist_change(diameter, 'diameter')
-        _persist_change(flow_th, 'flow_th')
-        _persist_change(cellprob_th, 'cellprob_th')
-        _persist_change(use_gpu, 'use_gpu')
+                def _persist_change(comp, key: str):
+                    comp.change(
+                        fn=None,
+                        inputs=[comp],
+                        outputs=[],
+                        js=f"""
+                        (v) => {{
+                            try {{
+                                const k = '{SETTINGS_KEY}';
+                                const raw = localStorage.getItem(k);
+                                const s = raw ? JSON.parse(raw) : {{}};
+                                s['{key}'] = v;
+                                localStorage.setItem(k, JSON.stringify(s));
+                            }} catch (e) {{
+                                console.warn('Failed to save setting {key}:', e);
+                            }}
+                        }}
+                        """,
+                    )
 
-        _persist_change(rad_in, 'rad_in')
-        _persist_change(rad_out, 'rad_out')
-        _persist_change(rad_min_obj, 'rad_min_obj')
-        _persist_change(use_radial_roi_tgt, 'use_radial_roi_tgt')
-        _persist_change(use_radial_roi_ref, 'use_radial_roi_ref')
+                _persist_change(seg_source, 'seg_source')
+                _persist_change(seg_chan, 'seg_chan')
+                _persist_change(diameter, 'diameter')
+                _persist_change(flow_th, 'flow_th')
+                _persist_change(cellprob_th, 'cellprob_th')
+                _persist_change(use_gpu, 'use_gpu')
+                _persist_change(rad_in, 'rad_in')
+                _persist_change(rad_out, 'rad_out')
+                _persist_change(rad_min_obj, 'rad_min_obj')
+                _persist_change(use_radial_roi_tgt, 'use_radial_roi_tgt')
+                _persist_change(use_radial_roi_ref, 'use_radial_roi_ref')
+                _persist_change(tgt_chan, 'tgt_chan')
+                _persist_change(tgt_mask_mode, 'tgt_mask_mode')
+                _persist_change(tgt_sat_limit, 'tgt_sat_limit')
+                _persist_change(tgt_pct, 'tgt_pct')
+                _persist_change(tgt_min_obj, 'tgt_min_obj')
+                _persist_change(ref_chan, 'ref_chan')
+                _persist_change(ref_mask_mode, 'ref_mask_mode')
+                _persist_change(ref_sat_limit, 'ref_sat_limit')
+                _persist_change(ref_pct, 'ref_pct')
+                _persist_change(ref_min_obj, 'ref_min_obj')
+                _persist_change(px_w, 'px_w')
+                _persist_change(px_h, 'px_h')
+                _persist_change(label_scale, 'label_scale')
 
-        _persist_change(tgt_chan, 'tgt_chan')
-        _persist_change(tgt_mask_mode, 'tgt_mask_mode')
-        _persist_change(tgt_sat_limit, 'tgt_sat_limit')
-        _persist_change(tgt_pct, 'tgt_pct')
-        _persist_change(tgt_min_obj, 'tgt_min_obj')
+                def _set_label_scale(v: float):
+                    global LABEL_SCALE
+                    try:
+                        LABEL_SCALE = float(v)
+                    except Exception:
+                        pass
+                    return None
+                label_scale.change(fn=_set_label_scale, inputs=[label_scale], outputs=[])
 
-        _persist_change(ref_chan, 'ref_chan')
-        _persist_change(ref_mask_mode, 'ref_mask_mode')
-        _persist_change(ref_sat_limit, 'ref_sat_limit')
-        _persist_change(ref_pct, 'ref_pct')
-        _persist_change(ref_min_obj, 'ref_min_obj')
-        # Persist pixel size settings
-        _persist_change(px_w, 'px_w')
-        _persist_change(px_h, 'px_h')
-        _persist_change(label_scale, 'label_scale')
+                reset_settings.click(
+                    fn=None,
+                    inputs=[],
+                    outputs=[
+                        seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu,
+                        rad_in, rad_out, rad_min_obj,
+                        use_radial_roi_tgt, use_radial_roi_ref,
+                        tgt_chan, tgt_mask_mode, tgt_sat_limit, tgt_pct, tgt_min_obj,
+                        ref_chan, ref_mask_mode, ref_sat_limit, ref_pct, ref_min_obj,
+                        px_w, px_h,
+                        label_scale,
+                    ],
+                    js=f"""
+                    () => {{
+                        try {{
+                            localStorage.removeItem('{SETTINGS_KEY}');
+                        }} catch (e) {{
+                            console.warn('Failed to clear settings:', e);
+                        }}
+                        alert('Saved settings cleared. Restoring defaults.');
+                        return [
+                            'target', 'gray', 0, 0.4, 0.0, true,
+                            0.0, 100.0, 50,
+                            false, false,
+                            'gray', 'global_percentile', 254, 75.0, 50,
+                            'gray', 'global_percentile', 254, 75.0, 50,
+                            1.0, 1.0,
+                            {float(LABEL_SCALE)},
+                        ];
+                    }}
+                    """,
+                )
 
-        # Update global label scale when slider changes
-        def _set_label_scale(v: float):
-            global LABEL_SCALE
-            try:
-                LABEL_SCALE = float(v)
-            except Exception:
-                pass
-            return None
-        label_scale.change(fn=_set_label_scale, inputs=[label_scale], outputs=[])
+            # ---------------- Single image tab (new UI) ----------------
+            with gr.TabItem("Single image"):
+                s_masks_state = gr.State()
+                s_radial_mask_state = gr.State()
+                s_radial_label_state = gr.State()
+                s_mask_state = gr.State()
 
-        # Reset button clears stored settings
-        reset_settings.click(
-            fn=None,
-            inputs=[],
-            outputs=[
-                seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu,
-                rad_in, rad_out, rad_min_obj,
-                use_radial_roi_tgt, use_radial_roi_ref,
-                tgt_chan, tgt_mask_mode, tgt_sat_limit, tgt_pct, tgt_min_obj,
-                ref_chan, ref_mask_mode, ref_sat_limit, ref_pct, ref_min_obj,
-                px_w, px_h,
-                label_scale,
-            ],
-            js=f"""
-            () => {{
-                try {{
-                    localStorage.removeItem('{SETTINGS_KEY}');
-                }} catch (e) {{
-                    console.warn('Failed to clear settings:', e);
-                }}
-                alert('Saved settings cleared. Restoring defaults.');
-                return [
-                    'target', 'gray', 0, 0.4, 0.0, true,
-                    0.0, 100.0, 50,
-                    false, false,
-                    'gray', 'global_percentile', 254, 75.0, 50,
-                    'gray', 'global_percentile', 254, 75.0, 50,
-                    1.0, 1.0,
-                    {float(LABEL_SCALE)},
-                ];
-            }}
-            """,
-        )
+                with gr.Row():
+                    with gr.Column():
+                        s_img = gr.Image(type="pil", label="Image", image_mode="RGB", width=600)
+
+                        s_label_scale = gr.Slider(0.0, 5.0, value=float(LABEL_SCALE), step=0.1, label="Label size scale (0=hidden)")
+
+                        with gr.Accordion("Segmentation params", open=False):
+                            s_seg_chan = gr.Radio(["gray","R","G","B"], value="gray", label="Segmentation channel")
+                            s_diameter = gr.Slider(0, 200, value=0, step=1, label="Diameter (px, 0=auto)")
+                            s_flow_th = gr.Slider(0.0, 1.5, value=0.4, step=0.05, label="Flow threshold")
+                            s_cellprob_th = gr.Slider(-6.0, 6.0, value=0.0, step=0.1, label="Cellprob threshold")
+                            s_use_gpu = gr.Checkbox(value=True, label="Use GPU if available")
+                        s_run_seg_btn = gr.Button("1. Run Cellpose")
+                        s_seg_overlay = gr.Image(type="pil", label="Segmentation overlay", width=600)
+                        s_mask_img = gr.Image(type="pil", label="Segmentation label image", width=600)
+                        s_seg_tiff_file = gr.File(label="Download masks (label TIFF)")
+
+                        with gr.Accordion("Radial mask (optional)", open=False):
+                            s_rad_in = gr.Slider(0.0, 120.0, value=0.0, step=1.0, label="Radial inner % (0=中心)")
+                            s_rad_out = gr.Slider(0.0, 120.0, value=100.0, step=1.0, label="Radial outer % (100=境界)")
+                            s_rad_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
+                        s_run_rad_btn = gr.Button("2. Build Radial mask")
+                        s_rad_overlay = gr.Image(type="pil", label="Radial mask overlay", width=600)
+                        s_rad_tiff = gr.File(label="Download radial mask (TIFF)")
+                        s_rad_lbl_tiff = gr.File(label="Download radial labels (label TIFF)")
+
+                        s_use_radial_roi = gr.Checkbox(value=False, label="Use Radial ROI for Mask")
+
+                        with gr.Accordion("Mask", open=False):
+                            s_chan = gr.Radio(["gray","R","G","B"], value="gray", label="Measurement channel")
+                            s_mask_mode = gr.Radio(["none","global_percentile","global_otsu","per_cell_percentile","per_cell_otsu"], value="global_percentile", label="Masking mode")
+                            s_sat_limit = gr.Slider(0, 255, value=254, step=1, label="Saturation limit (abs, 8-bit scale)")
+                            s_pct = gr.Slider(0.0, 100.0, value=75.0, step=1.0, label="Percentile (Top p%)")
+                            s_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
+                        s_run_mask_btn = gr.Button("3. Apply Mask")
+                        s_mask_overlay = gr.Image(type="pil", label="Mask overlay", width=600)
+                        s_mask_tiff = gr.File(label="Download mask (TIFF)")
+
+                        s_quant_btn = gr.Button("4. Quantify")
+                        s_px_w = gr.Number(value=1.0, label="Pixel width (µm)")
+                        s_px_h = gr.Number(value=1.0, label="Pixel height (µm)")
+                        s_final_overlay = gr.Image(type="pil", label="Final overlay (Mask)", width=600)
+                        s_table = gr.Dataframe(label="Per-cell intensities", interactive=False, pinned_columns=1)
+                        s_csv_file = gr.File(label="Download CSV")
+                        s_img_on_mask = gr.Image(type="pil", label="Image on Mask", width=600)
+
+                        s_reset_settings = gr.Button("Reset saved settings (Single)")
+
+                # Hooks - Single
+                s_run_seg_btn.click(
+                    fn=run_segmentation_single,
+                    inputs=[s_img, s_seg_chan, s_diameter, s_flow_th, s_cellprob_th, s_use_gpu],
+                    outputs=[s_seg_overlay, s_seg_tiff_file, s_mask_img, s_masks_state],
+                )
+                s_run_rad_btn.click(
+                    fn=radial_mask,
+                    inputs=[s_masks_state, s_rad_in, s_rad_out, s_rad_min_obj],
+                    outputs=[s_rad_overlay, s_radial_mask_state, s_radial_label_state, s_rad_tiff, s_rad_lbl_tiff],
+                )
+                s_run_mask_btn.click(
+                    fn=apply_mask_with_roi,
+                    inputs=[s_img, s_masks_state, s_chan, s_sat_limit, s_mask_mode, s_pct, s_min_obj, s_use_radial_roi, s_radial_label_state, gr.State("single_mask")],
+                    outputs=[s_mask_overlay, s_mask_tiff, s_mask_state],
+                )
+                s_quant_btn.click(
+                    fn=integrate_and_quantify_single,
+                    inputs=[s_img, s_masks_state, s_mask_state, s_chan, s_px_w, s_px_h],
+                    outputs=[s_final_overlay, s_mask_tiff, s_table, s_csv_file, s_img_on_mask],
+                )
+
+                # ---------------- Persist settings (Single) ----------------
+                SINGLE_SETTINGS_KEY = "dcq_single_settings_v1"
+                demo.load(
+                    fn=None,
+                    inputs=[],
+                    outputs=[
+                        s_seg_chan, s_diameter, s_flow_th, s_cellprob_th, s_use_gpu,
+                        s_rad_in, s_rad_out, s_rad_min_obj,
+                        s_use_radial_roi,
+                        s_chan, s_mask_mode, s_sat_limit, s_pct, s_min_obj,
+                        s_px_w, s_px_h,
+                        s_label_scale,
+                    ],
+                    js=f"""
+                    () => {{
+                        try {{
+                            const raw = localStorage.getItem('{SINGLE_SETTINGS_KEY}');
+                            const d = {{
+                                s_seg_chan: 'gray', s_diameter: 0, s_flow_th: 0.4, s_cellprob_th: 0.0, s_use_gpu: true,
+                                s_rad_in: 0.0, s_rad_out: 100.0, s_rad_min_obj: 50,
+                                s_use_radial_roi: false,
+                                s_chan: 'gray', s_mask_mode: 'global_percentile', s_sat_limit: 254, s_pct: 75.0, s_min_obj: 50,
+                                s_px_w: 1.0, s_px_h: 1.0,
+                                s_label_scale: {float(LABEL_SCALE)},
+                            }};
+                            let s = raw ? {{...d, ...JSON.parse(raw)}} : d;
+                            const mapChan = (v) => ({{0:'gray',1:'R',2:'G',3:'B'}})[v] ?? v;
+                            s.s_seg_chan = mapChan(s.s_seg_chan);
+                            s.s_chan = mapChan(s.s_chan);
+                            return [
+                                s.s_seg_chan, s.s_diameter, s.s_flow_th, s.s_cellprob_th, s.s_use_gpu,
+                                s.s_rad_in, s.s_rad_out, s.s_rad_min_obj,
+                                s.s_use_radial_roi,
+                                s.s_chan, s.s_mask_mode, s.s_sat_limit, s.s_pct, s.s_min_obj,
+                                s.s_px_w, s.s_px_h,
+                                s.s_label_scale,
+                            ];
+                        }} catch (e) {{
+                            console.warn('Failed to load single settings:', e);
+                            return [
+                                'gray', 0, 0.4, 0.0, true,
+                                0.0, 100.0, 50,
+                                false,
+                                'gray', 'global_percentile', 254, 75.0, 50,
+                                1.0, 1.0,
+                                {float(LABEL_SCALE)},
+                            ];
+                        }}
+                    }}
+                    """,
+                )
+
+                def _persist_change_single(comp, key: str):
+                    comp.change(
+                        fn=None,
+                        inputs=[comp],
+                        outputs=[],
+                        js=f"""
+                        (v) => {{
+                            try {{
+                                const k = '{SINGLE_SETTINGS_KEY}';
+                                const raw = localStorage.getItem(k);
+                                const s = raw ? JSON.parse(raw) : {{}};
+                                s['{key}'] = v;
+                                localStorage.setItem(k, JSON.stringify(s));
+                            }} catch (e) {{
+                                console.warn('Failed to save single setting {key}:', e);
+                            }}
+                        }}
+                        """,
+                    )
+
+                for comp, key in [
+                    (s_seg_chan, 's_seg_chan'), (s_diameter, 's_diameter'), (s_flow_th, 's_flow_th'), (s_cellprob_th, 's_cellprob_th'), (s_use_gpu, 's_use_gpu'),
+                    (s_rad_in, 's_rad_in'), (s_rad_out, 's_rad_out'), (s_rad_min_obj, 's_rad_min_obj'), (s_use_radial_roi, 's_use_radial_roi'),
+                    (s_chan, 's_chan'), (s_mask_mode, 's_mask_mode'), (s_sat_limit, 's_sat_limit'), (s_pct, 's_pct'), (s_min_obj, 's_min_obj'),
+                    (s_px_w, 's_px_w'), (s_px_h, 's_px_h'), (s_label_scale, 's_label_scale'),
+                ]:
+                    _persist_change_single(comp, key)
+
+                def _set_label_scale_single(v: float):
+                    global LABEL_SCALE
+                    try:
+                        LABEL_SCALE = float(v)
+                    except Exception:
+                        pass
+                    return None
+                s_label_scale.change(fn=_set_label_scale_single, inputs=[s_label_scale], outputs=[])
+
+                s_reset_settings.click(
+                    fn=None,
+                    inputs=[],
+                    outputs=[
+                        s_seg_chan, s_diameter, s_flow_th, s_cellprob_th, s_use_gpu,
+                        s_rad_in, s_rad_out, s_rad_min_obj,
+                        s_use_radial_roi,
+                        s_chan, s_mask_mode, s_sat_limit, s_pct, s_min_obj,
+                        s_px_w, s_px_h,
+                        s_label_scale,
+                    ],
+                    js=f"""
+                    () => {{
+                        try {{
+                            localStorage.removeItem('{SINGLE_SETTINGS_KEY}');
+                        }} catch (e) {{
+                            console.warn('Failed to clear single settings:', e);
+                        }}
+                        alert('Single tab settings cleared.');
+                        return [
+                            'gray', 0, 0.4, 0.0, true,
+                            0.0, 100.0, 50,
+                            false,
+                            'gray', 'global_percentile', 254, 75.0, 50,
+                            1.0, 1.0,
+                            {float(LABEL_SCALE)},
+                        ];
+                    }}
+                    """,
+                )
     return demo
 
 if __name__ == "__main__":

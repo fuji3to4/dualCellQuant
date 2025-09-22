@@ -1,6 +1,9 @@
 # 🔬 DualCellQuant
 
-A stepwise Gradio app for per-cell quantification across two fluorescence images with Cellpose-SAM segmentation and flexible masking. This README documents only `dualCellQuant.py`.
+A stepwise Gradio app for per-cell quantification with Cellpose-SAM segmentation and flexible masking. Two workflows are available via tabs in `dualCellQuant.py`:
+
+- Dual images: Target + Reference images → AND mask → ratios and stats
+- Single image: One image → (optional) Radial mask → Mask → stats
 
 ## Features ✨
 
@@ -15,9 +18,20 @@ A stepwise Gradio app for per-cell quantification across two fluorescence images
   - Target/Reference ratio image and CSV export
 - 🖼️ Clear overlays with cell IDs and downloadable NumPy arrays for all masks
 
-## Workflow ▶️
+## Workflows ▶️
 
-### 1. 🧩 Run Cellpose-SAM segmentation
+### Single image (new)
+
+1. Run Cellpose-SAM segmentation on the uploaded image
+2. Build Radial mask (optional)
+3. Apply Mask (none/global/per-cell; saturation limit; min object size)
+4. Quantify per cell (on-mask and whole-cell stats; CSV export)
+
+Outputs: label mask TIFF, mask TIFF, table CSV, image overlay previews.
+
+### Dual images
+
+1. 🧩 Run Cellpose-SAM segmentation
 
 - Choose source image/channel and model thresholds
 - Outputs: label mask (.npy), overlays
@@ -98,6 +112,12 @@ python .\dualCellQuant.py
 
 Then open the local Gradio URL shown in the terminal.
 
+Optionally, you can mount the app under FastAPI at `/dualcellquant`:
+
+```pwsh
+poetry run uvicorn serve:app --port 7860
+```
+
 
 ## Outputs 📦
 
@@ -109,3 +129,4 @@ Then open the local Gradio URL shown in the terminal.
 
 - Radial outer >100% includes background near the cell. If you want Target/Reference masks computed only within ≤100%, add a toggle to clip ROI at 100%.
 - No persistent project/session saving; use the exported `.npy`/`.csv` files to reproduce results.
+- The Single image flow computes single-channel statistics only (no ratio). Ratios remain in the Dual images flow.
