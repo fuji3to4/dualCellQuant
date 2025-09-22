@@ -767,9 +767,13 @@ def build_ui():
         gr.Markdown(
             """
             # 🔬 **DualCellQuant**
-            - 2画像比較用と1画像用の2つのタブを用意しました。
-            - Single Image: Cellpose-SAM → (optional) Radial mask → Mask → Quantification
-            - Dual Images: 既存の2画像パイプライン（ターゲット/リファレンス、ANDマスク、比率など）
+            *Segment, filter, and compare cells across two fluorescence channels*
+            1. **Run Cellpose-SAM** to obtain segmentation masks.
+            2. **Build Radial mask** (optional).
+            3. **Apply Target mask** conditions.
+            4. **Apply Reference mask** conditions.
+            5. **Integrate** Target & Reference masks and view results.
+            Each step can be rerun to tune parameters before integration.
             """
         )
 
