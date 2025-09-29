@@ -18,6 +18,7 @@ from PIL import Image, ImageDraw, ImageFont
 import gradio as gr
 import tempfile
 from skimage import filters, morphology, measure, color
+from skimage import restoration
 import scipy.ndimage as ndi
 from cellpose import models
 
@@ -118,6 +119,165 @@ def pil_to_numpy_native(img: Image.Image) -> np.ndarray:
     if arr.ndim == 3 and arr.shape[2] == 4:
         arr = arr[:, :, :3]
     return arr.astype(np.float32, copy=False)
+
+# -----------------------
+# Preprocess helpers (Background correction & Normalization)
+# -----------------------
+
+def _apply_rolling_ball(channel: np.ndarray, radius: int) -> np.ndarray:
+    """Apply rolling-ball background estimation and subtract it.
+
+    channel: 2D float array. Values can be in arbitrary non-negative scale.
+    Returns non-negative array with background subtracted.
+    """
+    radius = int(max(1, radius))
+    try:
+        bg = restoration.rolling_ball(channel, radius=radius)
+        out = channel - bg
+        # keep non-negative
+        return np.clip(out, 0, None)
+    except Exception:
+        # Fallback: no-op on failure
+        return channel
+
+
+def background_correction(arr: np.ndarray, radius: int, enabled: bool) -> np.ndarray:
+    """Apply rolling-ball per-channel if enabled.
+
+    arr: HxW or HxWx3, float32
+    """
+    if not enabled:
+        return arr
+    if arr.ndim == 2:
+        return _apply_rolling_ball(arr, radius)
+    elif arr.ndim == 3 and arr.shape[2] >= 3:
+        chs = []
+        for i in range(3):
+            chs.append(_apply_rolling_ball(arr[:, :, i], radius))
+        return np.stack(chs, axis=2)
+    else:
+        return arr
+
+
+def _normalize_channel(ch: np.ndarray, method: str) -> np.ndarray:
+    eps = 1e-12
+    method = (method or "z-score").strip().lower()
+    if method == "z-score":
+        mu = float(np.nanmean(ch))
+        sigma = float(np.nanstd(ch))
+        return (ch - mu) / (sigma + eps)
+    elif method in ("min-max", "minmax"):
+        vmin = float(np.nanmin(ch))
+        vmax = float(np.nanmax(ch))
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+            return ch * 0.0
+        return (ch - vmin) / (vmax - vmin)
+    elif method.startswith("percentile") or method.startswith("pct"):
+        # percentile [1,99] -> [0,1]
+        vmin = float(np.nanpercentile(ch, 1.0))
+        vmax = float(np.nanpercentile(ch, 99.0))
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+            return ch * 0.0
+        ch2 = (ch - vmin) / (vmax - vmin)
+        return np.clip(ch2, 0.0, 1.0)
+    elif method in ("robust z-score", "robust_z", "robust"):
+        med = float(np.nanmedian(ch))
+        mad = float(np.nanmedian(np.abs(ch - med)))
+        sigma = 1.4826 * mad
+        return (ch - med) / (sigma + eps)
+    else:
+        # default: z-score
+        mu = float(np.nanmean(ch))
+        sigma = float(np.nanstd(ch))
+        return (ch - mu) / (sigma + eps)
+
+
+def normalize_array(arr: np.ndarray, enabled: bool, method: str) -> np.ndarray:
+    """Apply normalization per-channel if enabled.
+
+    Note: z-score/robust z-score may yield negative values. That is fine for
+    downstream numeric ops; visualization should clip/scale as needed.
+    """
+    if not enabled:
+        return arr
+    if arr.ndim == 2:
+        return _normalize_channel(arr, method)
+    elif arr.ndim == 3 and arr.shape[2] >= 3:
+        chs = []
+        for i in range(3):
+            chs.append(_normalize_channel(arr[:, :, i], method))
+        return np.stack(chs, axis=2)
+    else:
+        return arr
+
+
+def preprocess_for_processing(
+    img: Image.Image,
+    *,
+    use_native_scale: bool,
+    bg_enable: bool,
+    bg_radius: int,
+    norm_enable: bool,
+    norm_method: str,
+) -> np.ndarray:
+    """Produce a numpy array from PIL and apply optional background correction
+    and normalization.
+
+    use_native_scale: if True, start from native (e.g., 0-255) array; otherwise 0-1.
+    Returns float32 array in the same conceptual scale as the chosen start.
+    """
+    arr = pil_to_numpy_native(img) if use_native_scale else pil_to_numpy(img)
+    arr = background_correction(arr, int(bg_radius), bool(bg_enable))
+    arr = normalize_array(arr, bool(norm_enable), norm_method)
+    return arr.astype(np.float32, copy=False)
+
+
+def arr01_to_pil_for_preview(arr: np.ndarray) -> Image.Image:
+    """Convert arbitrary-range array to 0-1 for display then to uint8 PIL."""
+    # Scale each channel robustly for display if values are outside 0..1
+    a = arr
+    if a.ndim == 2:
+        # robust scaling to [0,1]
+        vmin = np.nanpercentile(a, 1.0)
+        vmax = np.nanpercentile(a, 99.0)
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+            vmin, vmax = float(np.nanmin(a)), float(np.nanmax(a))
+            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+                a = np.zeros_like(a)
+            else:
+                a = (a - vmin) / (vmax - vmin)
+        else:
+            a = (a - vmin) / (vmax - vmin)
+        a = np.clip(a, 0.0, 1.0)
+        return Image.fromarray((a * 255).astype(np.uint8))
+    elif a.ndim == 3 and a.shape[2] >= 3:
+        chs = []
+        for i in range(3):
+            ch = a[:, :, i]
+            vmin = np.nanpercentile(ch, 1.0)
+            vmax = np.nanpercentile(ch, 99.0)
+            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+                vmin, vmax = float(np.nanmin(ch)), float(np.nanmax(ch))
+                if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+                    ch = np.zeros_like(ch)
+                else:
+                    ch = (ch - vmin) / (vmax - vmin)
+            else:
+                ch = (ch - vmin) / (vmax - vmin)
+            chs.append(np.clip(ch, 0.0, 1.0))
+        out = (np.stack(chs, axis=2) * 255).astype(np.uint8)
+        return Image.fromarray(out)
+    else:
+        a = np.clip(a, 0.0, 1.0)
+        return Image.fromarray((a * 255).astype(np.uint8))
+
+
+def save_preview_tiff(arr: np.ndarray, stem: str) -> str:
+    """Save a preview-friendly TIFF (uint8) using robust scaling per channel."""
+    img = arr01_to_pil_for_preview(arr)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{stem}.tif")
+    img.save(tmp.name)
+    return tmp.name
 
 # --- ImageJ向けTIFF保存ヘルパー ---
 def save_bool_mask_tiff(mask: np.ndarray, stem: str) -> str:
@@ -309,9 +469,22 @@ def run_segmentation(
     flow_threshold: float,
     cellprob_threshold: float,
     use_gpu: bool,
+    pp_bg_enable: bool,
+    pp_bg_radius: int,
+    pp_norm_enable: bool,
+    pp_norm_method: str,
 ):
-    tgt = pil_to_numpy(target_img)
-    ref = pil_to_numpy(reference_img)
+    # Preprocess 0-1 arrays for processing
+    tgt = preprocess_for_processing(
+        target_img, use_native_scale=False,
+        bg_enable=pp_bg_enable, bg_radius=pp_bg_radius,
+        norm_enable=pp_norm_enable, norm_method=pp_norm_method,
+    )
+    ref = preprocess_for_processing(
+        reference_img, use_native_scale=False,
+        bg_enable=pp_bg_enable, bg_radius=pp_bg_radius,
+        norm_enable=pp_norm_enable, norm_method=pp_norm_method,
+    )
     if tgt.shape[:2] != ref.shape[:2]:
         raise ValueError(f"Image size mismatch: target {tgt.shape[:2]} vs reference {ref.shape[:2]}")
 
@@ -432,16 +605,26 @@ def apply_mask(
     min_obj_size: int,
     roi_labels: Optional[np.ndarray] = None,
     mask_name: str = "mask",
+    pp_bg_enable: bool = False,
+    pp_bg_radius: int = 50,
+    pp_norm_enable: bool = False,
+    pp_norm_method: str = "z-score",
 ):
     if masks is None:
         raise ValueError("Segmentation masks not provided. Run segmentation first.")
 
-    arr = pil_to_numpy(img)
+    arr = preprocess_for_processing(
+        img, use_native_scale=False,
+        bg_enable=pp_bg_enable, bg_radius=pp_bg_radius,
+        norm_enable=pp_norm_enable, norm_method=pp_norm_method,
+    )
     gray = extract_single_channel(arr, measure_channel)
 
-    # Saturation limit: UIは8bit絶対値(0-255)で入力 -> 0-1へ変換して使用
+    # Saturation limitは元画像（0-1スケール）で判定する（正規化の影響を避ける）
+    orig01 = pil_to_numpy(img)
+    gray_sat = extract_single_channel(orig01, measure_channel)
     sat_thr01 = _to_float_saturation_limit(img, float(sat_limit))
-    nonsat = gray < sat_thr01
+    nonsat = gray_sat < sat_thr01
 
     mask_total = np.zeros_like(masks, dtype=bool)
 
@@ -507,20 +690,40 @@ def integrate_and_quantify(
     ref_chan: int,
     pixel_width_um: float,
     pixel_height_um: float,
+    pp_bg_enable: bool,
+    pp_bg_radius: int,
+    pp_norm_enable: bool,
+    pp_norm_method: str,
 
 ):
     if masks is None or tgt_mask is None or ref_mask is None:
         raise ValueError("Run previous steps first.")
 
     # Visualization arrays (0-1) for overlays/ratio
-    tgt_vis = pil_to_numpy(target_img)
-    ref_vis = pil_to_numpy(reference_img)
+    tgt_vis = preprocess_for_processing(
+        target_img, use_native_scale=False,
+        bg_enable=pp_bg_enable, bg_radius=pp_bg_radius,
+        norm_enable=pp_norm_enable, norm_method=pp_norm_method,
+    )
+    ref_vis = preprocess_for_processing(
+        reference_img, use_native_scale=False,
+        bg_enable=pp_bg_enable, bg_radius=pp_bg_radius,
+        norm_enable=pp_norm_enable, norm_method=pp_norm_method,
+    )
     if tgt_vis.shape[:2] != ref_vis.shape[:2]:
         raise ValueError("Image size mismatch between target and reference")
 
     # Native arrays (original scale) for measurements to match ImageJ
-    tgt_nat = pil_to_numpy_native(target_img)
-    ref_nat = pil_to_numpy_native(reference_img)
+    tgt_nat = preprocess_for_processing(
+        target_img, use_native_scale=True,
+        bg_enable=pp_bg_enable, bg_radius=pp_bg_radius,
+        norm_enable=pp_norm_enable, norm_method=pp_norm_method,
+    )
+    ref_nat = preprocess_for_processing(
+        reference_img, use_native_scale=True,
+        bg_enable=pp_bg_enable, bg_radius=pp_bg_radius,
+        norm_enable=pp_norm_enable, norm_method=pp_norm_method,
+    )
 
     tgt_gray_vis = extract_single_channel(tgt_vis, tgt_chan)
     ref_gray_vis = extract_single_channel(ref_vis, ref_chan)
@@ -657,8 +860,16 @@ def run_segmentation_single(
     flow_threshold: float,
     cellprob_threshold: float,
     use_gpu: bool,
+    pp_bg_enable: bool,
+    pp_bg_radius: int,
+    pp_norm_enable: bool,
+    pp_norm_method: str,
 ):
-    arr = pil_to_numpy(image)
+    arr = preprocess_for_processing(
+        image, use_native_scale=False,
+        bg_enable=pp_bg_enable, bg_radius=pp_bg_radius,
+        norm_enable=pp_norm_enable, norm_method=pp_norm_method,
+    )
     gray = extract_single_channel(arr, seg_channel)
     model = get_model(use_gpu)
     result = model.eval(
@@ -693,13 +904,25 @@ def integrate_and_quantify_single(
     chan: int | str,
     pixel_width_um: float,
     pixel_height_um: float,
+    pp_bg_enable: bool,
+    pp_bg_radius: int,
+    pp_norm_enable: bool,
+    pp_norm_method: str,
 ):
     if masks is None or mask_bool is None:
         raise ValueError("Run previous steps first.")
 
     # Visualization array (0-1) and native array (original scale)
-    vis = pil_to_numpy(image)
-    nat = pil_to_numpy_native(image)
+    vis = preprocess_for_processing(
+        image, use_native_scale=False,
+        bg_enable=pp_bg_enable, bg_radius=pp_bg_radius,
+        norm_enable=pp_norm_enable, norm_method=pp_norm_method,
+    )
+    nat = preprocess_for_processing(
+        image, use_native_scale=True,
+        bg_enable=pp_bg_enable, bg_radius=pp_bg_radius,
+        norm_enable=pp_norm_enable, norm_method=pp_norm_method,
+    )
     gray_vis = extract_single_channel(vis, chan)
     gray_nat = extract_single_channel(nat, chan)
 
@@ -785,11 +1008,30 @@ def build_ui():
                 radial_label_state = gr.State()          # labeled mask
                 tgt_mask_state = gr.State()
                 ref_mask_state = gr.State()
+                # Preprocess preview states
+                tgt_pp_state = gr.State()
+                ref_pp_state = gr.State()
 
                 with gr.Row():
                     with gr.Column():
                         tgt = gr.Image(type="pil", label="Target image", image_mode="RGB", width=600)
                         ref = gr.Image(type="pil", label="Reference image", image_mode="RGB", width=600)
+
+                        with gr.Accordion("Preprocess (optional)", open=False):
+                            pp_bg_enable = gr.Checkbox(value=False, label="Background correction (Rolling ball)")
+                            pp_bg_radius = gr.Slider(1, 300, value=50, step=1, label="Rolling ball radius (px)")
+                            pp_norm_enable = gr.Checkbox(value=False, label="Normalization")
+                            pp_norm_method = gr.Dropdown([
+                                "z-score",
+                                "robust z-score",
+                                "min-max",
+                                "percentile [1,99]",
+                            ], value="z-score", label="Normalization method")
+                            pp_preview_btn = gr.Button("Preview preprocessed images")
+                            tgt_pp_img = gr.Image(type="pil", label="Preprocessed Target (preview)", width=600)
+                            ref_pp_img = gr.Image(type="pil", label="Preprocessed Reference (preview)", width=600)
+                            tgt_pp_tiff = gr.File(label="Download preprocessed Target (TIFF)")
+                            ref_pp_tiff = gr.File(label="Download preprocessed Reference (TIFF)")
 
                         # Label size control (helpful for Linux servers)
                         label_scale = gr.Slider(0.0, 5.0, value=float(LABEL_SCALE), step=0.1, label="Label size scale (0=hidden)")
@@ -860,9 +1102,27 @@ def build_ui():
 
                         reset_settings = gr.Button("Reset saved settings")
 
+                # --- Callbacks: Preprocess preview (Dual) ---
+                def _preview_dual(img_a: Image.Image, img_b: Image.Image, bg_en: bool, bg_r: int, nm_en: bool, nm_m: str):
+                    if img_a is None or img_b is None:
+                        return None, None, None, None
+                    a = preprocess_for_processing(img_a, use_native_scale=False, bg_enable=bg_en, bg_radius=bg_r, norm_enable=nm_en, norm_method=nm_m)
+                    b = preprocess_for_processing(img_b, use_native_scale=False, bg_enable=bg_en, bg_radius=bg_r, norm_enable=nm_en, norm_method=nm_m)
+                    a_img = arr01_to_pil_for_preview(a)
+                    b_img = arr01_to_pil_for_preview(b)
+                    a_tif = save_preview_tiff(a, "tgt_preprocessed")
+                    b_tif = save_preview_tiff(b, "ref_preprocessed")
+                    return a_img, b_img, a_tif, b_tif
+
+                pp_preview_btn.click(
+                    fn=_preview_dual,
+                    inputs=[tgt, ref, pp_bg_enable, pp_bg_radius, pp_norm_enable, pp_norm_method],
+                    outputs=[tgt_pp_img, ref_pp_img, tgt_pp_tiff, ref_pp_tiff],
+                )
+
                 run_seg_btn.click(
                     fn=run_segmentation,
-                    inputs=[tgt, ref, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu],
+                    inputs=[tgt, ref, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu, pp_bg_enable, pp_bg_radius, pp_norm_enable, pp_norm_method],
                     outputs=[seg_overlay, seg_tiff_file, mask_img, masks_state],
                 )
                 run_rad_btn.click(
@@ -871,18 +1131,18 @@ def build_ui():
                     outputs=[rad_overlay, radial_mask_state, radial_label_state, rad_tiff, rad_lbl_tiff],
                 )
                 run_tgt_btn.click(
-                    fn=apply_mask_with_roi,
-                    inputs=[tgt, masks_state, tgt_chan, tgt_sat_limit, tgt_mask_mode, tgt_pct, tgt_min_obj, use_radial_roi_tgt, radial_label_state, gr.State("target_mask")],
+                    fn=lambda img, m, ch, sat, mode, p, mino, use_roi, roi_labels, name, bg_en, bg_r, nm_en, nm_m: apply_mask(img, m, ch, sat, mode, p, mino, roi_labels if use_roi else None, name, bg_en, bg_r, nm_en, nm_m),
+                    inputs=[tgt, masks_state, tgt_chan, tgt_sat_limit, tgt_mask_mode, tgt_pct, tgt_min_obj, use_radial_roi_tgt, radial_label_state, gr.State("target_mask"), pp_bg_enable, pp_bg_radius, pp_norm_enable, pp_norm_method],
                     outputs=[tgt_overlay, tgt_tiff, tgt_mask_state],
                 )
                 run_ref_btn.click(
-                    fn=apply_mask_with_roi,
-                    inputs=[ref, masks_state, ref_chan, ref_sat_limit, ref_mask_mode, ref_pct, ref_min_obj, use_radial_roi_ref, radial_label_state, gr.State("reference_mask")],
+                    fn=lambda img, m, ch, sat, mode, p, mino, use_roi, roi_labels, name, bg_en, bg_r, nm_en, nm_m: apply_mask(img, m, ch, sat, mode, p, mino, roi_labels if use_roi else None, name, bg_en, bg_r, nm_en, nm_m),
+                    inputs=[ref, masks_state, ref_chan, ref_sat_limit, ref_mask_mode, ref_pct, ref_min_obj, use_radial_roi_ref, radial_label_state, gr.State("reference_mask"), pp_bg_enable, pp_bg_radius, pp_norm_enable, pp_norm_method],
                     outputs=[ref_overlay, ref_tiff, ref_mask_state],
                 )
                 integrate_btn.click(
                     fn=integrate_and_quantify,
-                    inputs=[tgt, ref, masks_state, tgt_mask_state, ref_mask_state, tgt_chan, ref_chan, px_w, px_h],
+                    inputs=[tgt, ref, masks_state, tgt_mask_state, ref_mask_state, tgt_chan, ref_chan, px_w, px_h, pp_bg_enable, pp_bg_radius, pp_norm_enable, pp_norm_method],
                     outputs=[final_overlay, mask_tiff, table, csv_file, tgt_on_and_img, ref_on_and_img, ratio_img],
                 )
 
@@ -893,6 +1153,7 @@ def build_ui():
                     inputs=[],
                     outputs=[
                         seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu,
+                        pp_bg_enable, pp_bg_radius, pp_norm_enable, pp_norm_method,
                         rad_in, rad_out, rad_min_obj,
                         use_radial_roi_tgt, use_radial_roi_ref,
                         tgt_chan, tgt_mask_mode, tgt_sat_limit, tgt_pct, tgt_min_obj,
@@ -906,6 +1167,7 @@ def build_ui():
                             const raw = localStorage.getItem('{SETTINGS_KEY}');
                             const d = {{
                                 seg_source: 'target', seg_chan: 'gray', diameter: 0, flow_th: 0.4, cellprob_th: 0.0, use_gpu: true,
+                                pp_bg_enable: false, pp_bg_radius: 50, pp_norm_enable: false, pp_norm_method: 'z-score',
                                 rad_in: 0.0, rad_out: 100.0, rad_min_obj: 50,
                                 use_radial_roi_tgt: false, use_radial_roi_ref: false,
                                 tgt_chan: 'gray', tgt_mask_mode: 'global_percentile', tgt_sat_limit: 254, tgt_pct: 75.0, tgt_min_obj: 50,
@@ -925,6 +1187,10 @@ def build_ui():
                                 s.flow_th,
                                 s.cellprob_th,
                                 s.use_gpu,
+                                s.pp_bg_enable,
+                                s.pp_bg_radius,
+                                s.pp_norm_enable,
+                                s.pp_norm_method,
                                 s.rad_in,
                                 s.rad_out,
                                 s.rad_min_obj,
@@ -948,6 +1214,7 @@ def build_ui():
                             console.warn('Failed to load saved settings:', e);
                             return [
                                 'target', 'gray', 0, 0.4, 0.0, true,
+                                false, 50, false, 'z-score',
                                 0.0, 100.0, 50,
                                 false, false,
                                 'gray', 'global_percentile', 254, 75.0, 50,
@@ -986,6 +1253,10 @@ def build_ui():
                 _persist_change(flow_th, 'flow_th')
                 _persist_change(cellprob_th, 'cellprob_th')
                 _persist_change(use_gpu, 'use_gpu')
+                _persist_change(pp_bg_enable, 'pp_bg_enable')
+                _persist_change(pp_bg_radius, 'pp_bg_radius')
+                _persist_change(pp_norm_enable, 'pp_norm_enable')
+                _persist_change(pp_norm_method, 'pp_norm_method')
                 _persist_change(rad_in, 'rad_in')
                 _persist_change(rad_out, 'rad_out')
                 _persist_change(rad_min_obj, 'rad_min_obj')
@@ -1019,6 +1290,7 @@ def build_ui():
                     inputs=[],
                     outputs=[
                         seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu,
+                        pp_bg_enable, pp_bg_radius, pp_norm_enable, pp_norm_method,
                         rad_in, rad_out, rad_min_obj,
                         use_radial_roi_tgt, use_radial_roi_ref,
                         tgt_chan, tgt_mask_mode, tgt_sat_limit, tgt_pct, tgt_min_obj,
@@ -1036,6 +1308,7 @@ def build_ui():
                         alert('Saved settings cleared. Restoring defaults.');
                         return [
                             'target', 'gray', 0, 0.4, 0.0, true,
+                            false, 50, false, 'z-score',
                             0.0, 100.0, 50,
                             false, false,
                             'gray', 'global_percentile', 254, 75.0, 50,
@@ -1057,6 +1330,20 @@ def build_ui():
                 with gr.Row():
                     with gr.Column():
                         s_img = gr.Image(type="pil", label="Image", image_mode="RGB", width=600)
+
+                        with gr.Accordion("Preprocess (optional)", open=False):
+                            s_pp_bg_enable = gr.Checkbox(value=False, label="Background correction (Rolling ball)")
+                            s_pp_bg_radius = gr.Slider(1, 300, value=50, step=1, label="Rolling ball radius (px)")
+                            s_pp_norm_enable = gr.Checkbox(value=False, label="Normalization")
+                            s_pp_norm_method = gr.Dropdown([
+                                "z-score",
+                                "robust z-score",
+                                "min-max",
+                                "percentile [1,99]",
+                            ], value="z-score", label="Normalization method")
+                            s_pp_preview_btn = gr.Button("Preview preprocessed image")
+                            s_pp_img = gr.Image(type="pil", label="Preprocessed (preview)", width=600)
+                            s_pp_tiff = gr.File(label="Download preprocessed (TIFF)")
 
                         s_label_scale = gr.Slider(0.0, 5.0, value=float(LABEL_SCALE), step=0.1, label="Label size scale (0=hidden)")
 
@@ -1102,10 +1389,23 @@ def build_ui():
 
                         s_reset_settings = gr.Button("Reset saved settings (Single)")
 
+                # --- Callback: Preprocess preview (Single) ---
+                def _preview_single(img: Image.Image, bg_en: bool, bg_r: int, nm_en: bool, nm_m: str):
+                    if img is None:
+                        return None, None
+                    a = preprocess_for_processing(img, use_native_scale=False, bg_enable=bg_en, bg_radius=bg_r, norm_enable=nm_en, norm_method=nm_m)
+                    tif = save_preview_tiff(a, "single_preprocessed")
+                    return arr01_to_pil_for_preview(a), tif
+                s_pp_preview_btn.click(
+                    fn=_preview_single,
+                    inputs=[s_img, s_pp_bg_enable, s_pp_bg_radius, s_pp_norm_enable, s_pp_norm_method],
+                    outputs=[s_pp_img, s_pp_tiff],
+                )
+
                 # Hooks - Single
                 s_run_seg_btn.click(
                     fn=run_segmentation_single,
-                    inputs=[s_img, s_seg_chan, s_diameter, s_flow_th, s_cellprob_th, s_use_gpu],
+                    inputs=[s_img, s_seg_chan, s_diameter, s_flow_th, s_cellprob_th, s_use_gpu, s_pp_bg_enable, s_pp_bg_radius, s_pp_norm_enable, s_pp_norm_method],
                     outputs=[s_seg_overlay, s_seg_tiff_file, s_mask_img, s_masks_state],
                 )
                 s_run_rad_btn.click(
@@ -1114,13 +1414,13 @@ def build_ui():
                     outputs=[s_rad_overlay, s_radial_mask_state, s_radial_label_state, s_rad_tiff, s_rad_lbl_tiff],
                 )
                 s_run_mask_btn.click(
-                    fn=apply_mask_with_roi,
-                    inputs=[s_img, s_masks_state, s_chan, s_sat_limit, s_mask_mode, s_pct, s_min_obj, s_use_radial_roi, s_radial_label_state, gr.State("single_mask")],
+                    fn=lambda img, m, ch, sat, mode, p, mino, use_roi, roi_labels, name, bg_en, bg_r, nm_en, nm_m: apply_mask(img, m, ch, sat, mode, p, mino, roi_labels if use_roi else None, name, bg_en, bg_r, nm_en, nm_m),
+                    inputs=[s_img, s_masks_state, s_chan, s_sat_limit, s_mask_mode, s_pct, s_min_obj, s_use_radial_roi, s_radial_label_state, gr.State("single_mask"), s_pp_bg_enable, s_pp_bg_radius, s_pp_norm_enable, s_pp_norm_method],
                     outputs=[s_mask_overlay, s_mask_tiff, s_mask_state],
                 )
                 s_quant_btn.click(
                     fn=integrate_and_quantify_single,
-                    inputs=[s_img, s_masks_state, s_mask_state, s_chan, s_px_w, s_px_h],
+                    inputs=[s_img, s_masks_state, s_mask_state, s_chan, s_px_w, s_px_h, s_pp_bg_enable, s_pp_bg_radius, s_pp_norm_enable, s_pp_norm_method],
                     outputs=[s_final_overlay, s_mask_tiff, s_table, s_csv_file, s_img_on_mask],
                 )
 
@@ -1130,6 +1430,7 @@ def build_ui():
                     fn=None,
                     inputs=[],
                     outputs=[
+                        s_pp_bg_enable, s_pp_bg_radius, s_pp_norm_enable, s_pp_norm_method,
                         s_seg_chan, s_diameter, s_flow_th, s_cellprob_th, s_use_gpu,
                         s_rad_in, s_rad_out, s_rad_min_obj,
                         s_use_radial_roi,
@@ -1142,6 +1443,7 @@ def build_ui():
                         try {{
                             const raw = localStorage.getItem('{SINGLE_SETTINGS_KEY}');
                             const d = {{
+                                s_pp_bg_enable: false, s_pp_bg_radius: 50, s_pp_norm_enable: false, s_pp_norm_method: 'z-score',
                                 s_seg_chan: 'gray', s_diameter: 0, s_flow_th: 0.4, s_cellprob_th: 0.0, s_use_gpu: true,
                                 s_rad_in: 0.0, s_rad_out: 100.0, s_rad_min_obj: 50,
                                 s_use_radial_roi: false,
@@ -1154,6 +1456,7 @@ def build_ui():
                             s.s_seg_chan = mapChan(s.s_seg_chan);
                             s.s_chan = mapChan(s.s_chan);
                             return [
+                                s.s_pp_bg_enable, s.s_pp_bg_radius, s.s_pp_norm_enable, s.s_pp_norm_method,
                                 s.s_seg_chan, s.s_diameter, s.s_flow_th, s.s_cellprob_th, s.s_use_gpu,
                                 s.s_rad_in, s.s_rad_out, s.s_rad_min_obj,
                                 s.s_use_radial_roi,
@@ -1164,6 +1467,7 @@ def build_ui():
                         }} catch (e) {{
                             console.warn('Failed to load single settings:', e);
                             return [
+                                false, 50, false, 'z-score',
                                 'gray', 0, 0.4, 0.0, true,
                                 0.0, 100.0, 50,
                                 false,
@@ -1197,6 +1501,7 @@ def build_ui():
                     )
 
                 for comp, key in [
+                    (s_pp_bg_enable, 's_pp_bg_enable'), (s_pp_bg_radius, 's_pp_bg_radius'), (s_pp_norm_enable, 's_pp_norm_enable'), (s_pp_norm_method, 's_pp_norm_method'),
                     (s_seg_chan, 's_seg_chan'), (s_diameter, 's_diameter'), (s_flow_th, 's_flow_th'), (s_cellprob_th, 's_cellprob_th'), (s_use_gpu, 's_use_gpu'),
                     (s_rad_in, 's_rad_in'), (s_rad_out, 's_rad_out'), (s_rad_min_obj, 's_rad_min_obj'), (s_use_radial_roi, 's_use_radial_roi'),
                     (s_chan, 's_chan'), (s_mask_mode, 's_mask_mode'), (s_sat_limit, 's_sat_limit'), (s_pct, 's_pct'), (s_min_obj, 's_min_obj'),
@@ -1217,6 +1522,7 @@ def build_ui():
                     fn=None,
                     inputs=[],
                     outputs=[
+                        s_pp_bg_enable, s_pp_bg_radius, s_pp_norm_enable, s_pp_norm_method,
                         s_seg_chan, s_diameter, s_flow_th, s_cellprob_th, s_use_gpu,
                         s_rad_in, s_rad_out, s_rad_min_obj,
                         s_use_radial_roi,
@@ -1233,6 +1539,7 @@ def build_ui():
                         }}
                         alert('Single tab settings cleared.');
                         return [
+                            false, 50, false, 'z-score',
                             'gray', 0, 0.4, 0.0, true,
                             0.0, 100.0, 50,
                             false,
