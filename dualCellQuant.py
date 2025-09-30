@@ -141,19 +141,49 @@ def _apply_rolling_ball(channel: np.ndarray, radius: int) -> np.ndarray:
         return channel
 
 
-def background_correction(arr: np.ndarray, radius: int, enabled: bool) -> np.ndarray:
-    """Apply rolling-ball per-channel if enabled.
+def background_correction(
+    arr: np.ndarray,
+    radius: int,
+    enabled: bool,
+    *,
+    mode: str = "rolling",
+    dark_pct: float = 5.0,
+) -> np.ndarray:
+    """Apply background correction per-channel if enabled.
 
+    mode: 'rolling' or 'dark_subtract'
+    - rolling: ImageJ-like rolling-ball subtraction.
+    - dark_subtract: 下位 percentile の領域平均を引く（簡易BG補正）。
     arr: HxW or HxWx3, float32
     """
     if not enabled:
         return arr
+    mode = (mode or "rolling").strip().lower()
+
+    def _dark_subtract_2d(ch: np.ndarray, pct: float) -> np.ndarray:
+        p = float(np.clip(pct, 0.0, 50.0))  # 0-50%の範囲に制限
+        thr = float(np.percentile(ch, p))
+        # 下位p%の画素を抽出
+        dark_pixels = ch[ch <= thr]
+        if dark_pixels.size == 0:
+            return ch
+        dark_mean = float(np.mean(dark_pixels))
+        out = ch - dark_mean
+        return np.clip(out, 0.0, None)
+
     if arr.ndim == 2:
-        return _apply_rolling_ball(arr, radius)
+        if mode == "dark_subtract":
+            return _dark_subtract_2d(arr, dark_pct)
+        else:
+            return _apply_rolling_ball(arr, radius)
     elif arr.ndim == 3 and arr.shape[2] >= 3:
         chs = []
         for i in range(3):
-            chs.append(_apply_rolling_ball(arr[:, :, i], radius))
+            ch = arr[:, :, i]
+            if mode == "dark_subtract":
+                chs.append(_dark_subtract_2d(ch, dark_pct))
+            else:
+                chs.append(_apply_rolling_ball(ch, radius))
         return np.stack(chs, axis=2)
     else:
         return arr
@@ -217,6 +247,8 @@ def preprocess_for_processing(
     use_native_scale: bool,
     bg_enable: bool,
     bg_radius: int,
+    bg_mode: str = "rolling",
+    bg_dark_pct: float = 5.0,
     norm_enable: bool,
     norm_method: str,
 ) -> np.ndarray:
@@ -227,7 +259,7 @@ def preprocess_for_processing(
     Returns float32 array in the same conceptual scale as the chosen start.
     """
     arr = pil_to_numpy_native(img) if use_native_scale else pil_to_numpy(img)
-    arr = background_correction(arr, int(bg_radius), bool(bg_enable))
+    arr = background_correction(arr, int(bg_radius), bool(bg_enable), mode=bg_mode, dark_pct=float(bg_dark_pct))
     arr = normalize_array(arr, bool(norm_enable), norm_method)
     return arr.astype(np.float32, copy=False)
 
@@ -236,40 +268,49 @@ def arr01_to_pil_for_preview(arr: np.ndarray) -> Image.Image:
     """Convert arbitrary-range array to 0-1 for display then to uint8 PIL."""
     # Scale each channel robustly for display if values are outside 0..1
     a = arr
+    eps = 1e-6
+    # If already in 0..1 range, just clip and convert to uint8 to avoid amplifying tiny noise
+    try:
+        amin = float(np.nanmin(a))
+        amax = float(np.nanmax(a))
+    except Exception:
+        amin = 0.0
+        amax = 0.0
+
+    if amin >= 0.0 and amax <= 1.0:
+        clipped = np.clip(a, 0.0, 1.0)
+        if clipped.ndim == 2:
+            return Image.fromarray((clipped * 255).astype(np.uint8))
+        elif clipped.ndim == 3 and clipped.shape[2] >= 3:
+            out = (np.clip(clipped[:, :, :3], 0.0, 1.0) * 255).astype(np.uint8)
+            return Image.fromarray(out)
+
     if a.ndim == 2:
-        # robust scaling to [0,1]
-        vmin = np.nanpercentile(a, 1.0)
-        vmax = np.nanpercentile(a, 99.0)
-        if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+        # robust scaling to [0,1] but avoid division by tiny range
+        vmin = float(np.nanpercentile(a, 1.0))
+        vmax = float(np.nanpercentile(a, 99.0))
+        if not np.isfinite(vmin) or not np.isfinite(vmax) or (vmax - vmin) <= eps:
             vmin, vmax = float(np.nanmin(a)), float(np.nanmax(a))
-            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
-                a = np.zeros_like(a)
-            else:
-                a = (a - vmin) / (vmax - vmin)
-        else:
-            a = (a - vmin) / (vmax - vmin)
-        a = np.clip(a, 0.0, 1.0)
-        return Image.fromarray((a * 255).astype(np.uint8))
+        denom = (vmax - vmin) if (vmax - vmin) > eps else 1.0
+        a_scaled = (a - vmin) / denom
+        a_scaled = np.clip(a_scaled, 0.0, 1.0)
+        return Image.fromarray((a_scaled * 255).astype(np.uint8))
     elif a.ndim == 3 and a.shape[2] >= 3:
         chs = []
         for i in range(3):
             ch = a[:, :, i]
-            vmin = np.nanpercentile(ch, 1.0)
-            vmax = np.nanpercentile(ch, 99.0)
-            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+            vmin = float(np.nanpercentile(ch, 1.0))
+            vmax = float(np.nanpercentile(ch, 99.0))
+            if not np.isfinite(vmin) or not np.isfinite(vmax) or (vmax - vmin) <= eps:
                 vmin, vmax = float(np.nanmin(ch)), float(np.nanmax(ch))
-                if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
-                    ch = np.zeros_like(ch)
-                else:
-                    ch = (ch - vmin) / (vmax - vmin)
-            else:
-                ch = (ch - vmin) / (vmax - vmin)
-            chs.append(np.clip(ch, 0.0, 1.0))
+            denom = (vmax - vmin) if (vmax - vmin) > eps else 1.0
+            ch_scaled = (ch - vmin) / denom
+            chs.append(np.clip(ch_scaled, 0.0, 1.0))
         out = (np.stack(chs, axis=2) * 255).astype(np.uint8)
         return Image.fromarray(out)
     else:
-        a = np.clip(a, 0.0, 1.0)
-        return Image.fromarray((a * 255).astype(np.uint8))
+        a_clipped = np.clip(a, 0.0, 1.0)
+        return Image.fromarray((a_clipped * 255).astype(np.uint8))
 
 
 def save_preview_tiff(arr: np.ndarray, stem: str) -> str:
@@ -473,16 +514,19 @@ def run_segmentation(
     pp_bg_radius: int,
     pp_norm_enable: bool,
     pp_norm_method: str,
+    *,
+    bg_mode: str = "rolling",
+    bg_dark_pct: float = 5.0,
 ):
     # Preprocess 0-1 arrays for processing
     tgt = preprocess_for_processing(
         target_img, use_native_scale=False,
-        bg_enable=pp_bg_enable, bg_radius=pp_bg_radius,
+        bg_enable=pp_bg_enable, bg_radius=pp_bg_radius, bg_mode=bg_mode, bg_dark_pct=bg_dark_pct,
         norm_enable=pp_norm_enable, norm_method=pp_norm_method,
     )
     ref = preprocess_for_processing(
         reference_img, use_native_scale=False,
-        bg_enable=pp_bg_enable, bg_radius=pp_bg_radius,
+        bg_enable=pp_bg_enable, bg_radius=pp_bg_radius, bg_mode=bg_mode, bg_dark_pct=bg_dark_pct,
         norm_enable=pp_norm_enable, norm_method=pp_norm_method,
     )
     if tgt.shape[:2] != ref.shape[:2]:
@@ -864,10 +908,13 @@ def run_segmentation_single(
     pp_bg_radius: int,
     pp_norm_enable: bool,
     pp_norm_method: str,
+    *,
+    bg_mode: str = "rolling",
+    bg_dark_pct: float = 5.0,
 ):
     arr = preprocess_for_processing(
         image, use_native_scale=False,
-        bg_enable=pp_bg_enable, bg_radius=pp_bg_radius,
+        bg_enable=pp_bg_enable, bg_radius=pp_bg_radius, bg_mode=bg_mode, bg_dark_pct=bg_dark_pct,
         norm_enable=pp_norm_enable, norm_method=pp_norm_method,
     )
     gray = extract_single_channel(arr, seg_channel)
@@ -1018,8 +1065,10 @@ def build_ui():
                         ref = gr.Image(type="pil", label="Reference image", image_mode="RGB", width=600)
 
                         with gr.Accordion("Preprocess (optional)", open=False):
-                            pp_bg_enable = gr.Checkbox(value=False, label="Background correction (Rolling ball)")
+                            pp_bg_enable = gr.Checkbox(value=False, label="Background correction")
+                            pp_bg_mode = gr.Dropdown(["rolling","dark_subtract"], value="rolling", label="BG method")
                             pp_bg_radius = gr.Slider(1, 300, value=50, step=1, label="Rolling ball radius (px)")
+                            pp_dark_pct = gr.Slider(0.0, 50.0, value=5.0, step=0.5, label="Dark percentile (%)")
                             pp_norm_enable = gr.Checkbox(value=False, label="Normalization")
                             pp_norm_method = gr.Dropdown([
                                 "z-score",
@@ -1103,11 +1152,11 @@ def build_ui():
                         reset_settings = gr.Button("Reset saved settings")
 
                 # --- Callbacks: Preprocess preview (Dual) ---
-                def _preview_dual(img_a: Image.Image, img_b: Image.Image, bg_en: bool, bg_r: int, nm_en: bool, nm_m: str):
+                def _preview_dual(img_a: Image.Image, img_b: Image.Image, bg_en: bool, bg_mode: str, bg_r: int, dark_pct: float, nm_en: bool, nm_m: str):
                     if img_a is None or img_b is None:
                         return None, None, None, None
-                    a = preprocess_for_processing(img_a, use_native_scale=False, bg_enable=bg_en, bg_radius=bg_r, norm_enable=nm_en, norm_method=nm_m)
-                    b = preprocess_for_processing(img_b, use_native_scale=False, bg_enable=bg_en, bg_radius=bg_r, norm_enable=nm_en, norm_method=nm_m)
+                    a = preprocess_for_processing(img_a, use_native_scale=False, bg_enable=bg_en, bg_radius=bg_r, bg_mode=bg_mode, bg_dark_pct=dark_pct, norm_enable=nm_en, norm_method=nm_m)
+                    b = preprocess_for_processing(img_b, use_native_scale=False, bg_enable=bg_en, bg_radius=bg_r, bg_mode=bg_mode, bg_dark_pct=dark_pct, norm_enable=nm_en, norm_method=nm_m)
                     a_img = arr01_to_pil_for_preview(a)
                     b_img = arr01_to_pil_for_preview(b)
                     a_tif = save_preview_tiff(a, "tgt_preprocessed")
@@ -1116,13 +1165,29 @@ def build_ui():
 
                 pp_preview_btn.click(
                     fn=_preview_dual,
-                    inputs=[tgt, ref, pp_bg_enable, pp_bg_radius, pp_norm_enable, pp_norm_method],
+                    inputs=[tgt, ref, pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method],
                     outputs=[tgt_pp_img, ref_pp_img, tgt_pp_tiff, ref_pp_tiff],
                 )
 
+                # Show radius or dark percentile depending on BG mode
+                def _pp_bg_mode_changed(mode: str):
+                    m = (mode or "rolling").lower()
+                    show_radius = (m == "rolling")
+                    show_dark = (m == "dark_subtract")
+                    return gr.update(visible=show_radius), gr.update(visible=show_dark)
+
+                pp_bg_mode.change(
+                    fn=_pp_bg_mode_changed,
+                    inputs=[pp_bg_mode],
+                    outputs=[pp_bg_radius, pp_dark_pct],
+                )
+
+                def _run_seg_with_master(tgt_img, ref_img, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m):
+                    return run_segmentation(tgt_img, ref_img, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu, bool(bg_en), bg_r, bool(nm_en), nm_m, bg_mode=bg_mode, bg_dark_pct=dark_pct)
+
                 run_seg_btn.click(
-                    fn=run_segmentation,
-                    inputs=[tgt, ref, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu, pp_bg_enable, pp_bg_radius, pp_norm_enable, pp_norm_method],
+                    fn=_run_seg_with_master,
+                    inputs=[tgt, ref, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu, pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method],
                     outputs=[seg_overlay, seg_tiff_file, mask_img, masks_state],
                 )
                 run_rad_btn.click(
@@ -1131,18 +1196,18 @@ def build_ui():
                     outputs=[rad_overlay, radial_mask_state, radial_label_state, rad_tiff, rad_lbl_tiff],
                 )
                 run_tgt_btn.click(
-                    fn=lambda img, m, ch, sat, mode, p, mino, use_roi, roi_labels, name, bg_en, bg_r, nm_en, nm_m: apply_mask(img, m, ch, sat, mode, p, mino, roi_labels if use_roi else None, name, bg_en, bg_r, nm_en, nm_m),
-                    inputs=[tgt, masks_state, tgt_chan, tgt_sat_limit, tgt_mask_mode, tgt_pct, tgt_min_obj, use_radial_roi_tgt, radial_label_state, gr.State("target_mask"), pp_bg_enable, pp_bg_radius, pp_norm_enable, pp_norm_method],
+                    fn=lambda img, m, ch, sat, mode, p, mino, use_roi, roi_labels, name, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m: apply_mask(img, m, ch, sat, mode, p, mino, roi_labels if use_roi else None, name, bool(bg_en), (0 if bg_mode=='dark_subtract' else bg_r), bool(nm_en), nm_m),
+                    inputs=[tgt, masks_state, tgt_chan, tgt_sat_limit, tgt_mask_mode, tgt_pct, tgt_min_obj, use_radial_roi_tgt, radial_label_state, gr.State("target_mask"), pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method],
                     outputs=[tgt_overlay, tgt_tiff, tgt_mask_state],
                 )
                 run_ref_btn.click(
-                    fn=lambda img, m, ch, sat, mode, p, mino, use_roi, roi_labels, name, bg_en, bg_r, nm_en, nm_m: apply_mask(img, m, ch, sat, mode, p, mino, roi_labels if use_roi else None, name, bg_en, bg_r, nm_en, nm_m),
-                    inputs=[ref, masks_state, ref_chan, ref_sat_limit, ref_mask_mode, ref_pct, ref_min_obj, use_radial_roi_ref, radial_label_state, gr.State("reference_mask"), pp_bg_enable, pp_bg_radius, pp_norm_enable, pp_norm_method],
+                    fn=lambda img, m, ch, sat, mode, p, mino, use_roi, roi_labels, name, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m: apply_mask(img, m, ch, sat, mode, p, mino, roi_labels if use_roi else None, name, bool(bg_en), (0 if bg_mode=='dark_subtract' else bg_r), bool(nm_en), nm_m),
+                    inputs=[ref, masks_state, ref_chan, ref_sat_limit, ref_mask_mode, ref_pct, ref_min_obj, use_radial_roi_ref, radial_label_state, gr.State("reference_mask"), pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method],
                     outputs=[ref_overlay, ref_tiff, ref_mask_state],
                 )
                 integrate_btn.click(
-                    fn=integrate_and_quantify,
-                    inputs=[tgt, ref, masks_state, tgt_mask_state, ref_mask_state, tgt_chan, ref_chan, px_w, px_h, pp_bg_enable, pp_bg_radius, pp_norm_enable, pp_norm_method],
+                    fn=lambda tgt_img, ref_img, ms, tmask, rmask, tchan, rchan, pw, ph, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m: integrate_and_quantify(tgt_img, ref_img, ms, tmask, rmask, tchan, rchan, pw, ph, bool(bg_en), (0 if bg_mode=='dark_subtract' else bg_r), bool(nm_en), nm_m),
+                    inputs=[tgt, ref, masks_state, tgt_mask_state, ref_mask_state, tgt_chan, ref_chan, px_w, px_h, pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method],
                     outputs=[final_overlay, mask_tiff, table, csv_file, tgt_on_and_img, ref_on_and_img, ratio_img],
                 )
 
@@ -1153,7 +1218,7 @@ def build_ui():
                     inputs=[],
                     outputs=[
                         seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu,
-                        pp_bg_enable, pp_bg_radius, pp_norm_enable, pp_norm_method,
+                        pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method,
                         rad_in, rad_out, rad_min_obj,
                         use_radial_roi_tgt, use_radial_roi_ref,
                         tgt_chan, tgt_mask_mode, tgt_sat_limit, tgt_pct, tgt_min_obj,
@@ -1167,7 +1232,7 @@ def build_ui():
                             const raw = localStorage.getItem('{SETTINGS_KEY}');
                             const d = {{
                                 seg_source: 'target', seg_chan: 'gray', diameter: 0, flow_th: 0.4, cellprob_th: 0.0, use_gpu: true,
-                                pp_bg_enable: false, pp_bg_radius: 50, pp_norm_enable: false, pp_norm_method: 'z-score',
+                                pp_bg_enable: false, pp_bg_mode: 'rolling', pp_bg_radius: 50, pp_dark_pct: 5.0, pp_norm_enable: false, pp_norm_method: 'z-score',
                                 rad_in: 0.0, rad_out: 100.0, rad_min_obj: 50,
                                 use_radial_roi_tgt: false, use_radial_roi_ref: false,
                                 tgt_chan: 'gray', tgt_mask_mode: 'global_percentile', tgt_sat_limit: 254, tgt_pct: 75.0, tgt_min_obj: 50,
@@ -1188,7 +1253,9 @@ def build_ui():
                                 s.cellprob_th,
                                 s.use_gpu,
                                 s.pp_bg_enable,
+                                s.pp_bg_mode,
                                 s.pp_bg_radius,
+                                s.pp_dark_pct,
                                 s.pp_norm_enable,
                                 s.pp_norm_method,
                                 s.rad_in,
@@ -1214,7 +1281,7 @@ def build_ui():
                             console.warn('Failed to load saved settings:', e);
                             return [
                                 'target', 'gray', 0, 0.4, 0.0, true,
-                                false, 50, false, 'z-score',
+                                false, 'rolling', 50, 5.0, false, 'z-score',
                                 0.0, 100.0, 50,
                                 false, false,
                                 'gray', 'global_percentile', 254, 75.0, 50,
@@ -1255,6 +1322,8 @@ def build_ui():
                 _persist_change(use_gpu, 'use_gpu')
                 _persist_change(pp_bg_enable, 'pp_bg_enable')
                 _persist_change(pp_bg_radius, 'pp_bg_radius')
+                _persist_change(pp_bg_mode, 'pp_bg_mode')
+                _persist_change(pp_dark_pct, 'pp_dark_pct')
                 _persist_change(pp_norm_enable, 'pp_norm_enable')
                 _persist_change(pp_norm_method, 'pp_norm_method')
                 _persist_change(rad_in, 'rad_in')
@@ -1290,7 +1359,7 @@ def build_ui():
                     inputs=[],
                     outputs=[
                         seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu,
-                        pp_bg_enable, pp_bg_radius, pp_norm_enable, pp_norm_method,
+                        pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method,
                         rad_in, rad_out, rad_min_obj,
                         use_radial_roi_tgt, use_radial_roi_ref,
                         tgt_chan, tgt_mask_mode, tgt_sat_limit, tgt_pct, tgt_min_obj,
@@ -1308,7 +1377,7 @@ def build_ui():
                         alert('Saved settings cleared. Restoring defaults.');
                         return [
                             'target', 'gray', 0, 0.4, 0.0, true,
-                            false, 50, false, 'z-score',
+                            false, 'rolling', 50, 5.0, false, 'z-score',
                             0.0, 100.0, 50,
                             false, false,
                             'gray', 'global_percentile', 254, 75.0, 50,
@@ -1332,8 +1401,10 @@ def build_ui():
                         s_img = gr.Image(type="pil", label="Image", image_mode="RGB", width=600)
 
                         with gr.Accordion("Preprocess (optional)", open=False):
-                            s_pp_bg_enable = gr.Checkbox(value=False, label="Background correction (Rolling ball)")
+                            s_pp_bg_enable = gr.Checkbox(value=False, label="Background correction")
+                            s_pp_bg_mode = gr.Dropdown(["rolling","dark_subtract"], value="rolling", label="BG method")
                             s_pp_bg_radius = gr.Slider(1, 300, value=50, step=1, label="Rolling ball radius (px)")
+                            s_dark_pct = gr.Slider(0.0, 50.0, value=5.0, step=0.5, label="Dark percentile (%)")
                             s_pp_norm_enable = gr.Checkbox(value=False, label="Normalization")
                             s_pp_norm_method = gr.Dropdown([
                                 "z-score",
@@ -1390,22 +1461,37 @@ def build_ui():
                         s_reset_settings = gr.Button("Reset saved settings (Single)")
 
                 # --- Callback: Preprocess preview (Single) ---
-                def _preview_single(img: Image.Image, bg_en: bool, bg_r: int, nm_en: bool, nm_m: str):
+                def _preview_single(img: Image.Image, bg_en: bool, bg_mode: str, bg_r: int, dark_pct: float, nm_en: bool, nm_m: str):
                     if img is None:
                         return None, None
-                    a = preprocess_for_processing(img, use_native_scale=False, bg_enable=bg_en, bg_radius=bg_r, norm_enable=nm_en, norm_method=nm_m)
+                    a = preprocess_for_processing(img, use_native_scale=False, bg_enable=bg_en, bg_radius=bg_r, bg_mode=bg_mode, bg_dark_pct=dark_pct, norm_enable=nm_en, norm_method=nm_m)
                     tif = save_preview_tiff(a, "single_preprocessed")
                     return arr01_to_pil_for_preview(a), tif
                 s_pp_preview_btn.click(
                     fn=_preview_single,
-                    inputs=[s_img, s_pp_bg_enable, s_pp_bg_radius, s_pp_norm_enable, s_pp_norm_method],
+                    inputs=[s_img, s_pp_bg_enable, s_pp_bg_mode, s_pp_bg_radius, s_dark_pct, s_pp_norm_enable, s_pp_norm_method],
                     outputs=[s_pp_img, s_pp_tiff],
                 )
 
+                def s__pp_bg_mode_changed(mode: str):
+                    m = (mode or "rolling").lower()
+                    show_radius = (m == "rolling")
+                    show_dark = (m == "dark_subtract")
+                    return gr.update(visible=show_radius), gr.update(visible=show_dark)
+
+                s_pp_bg_mode.change(
+                    fn=s__pp_bg_mode_changed,
+                    inputs=[s_pp_bg_mode],
+                    outputs=[s_pp_bg_radius, s_dark_pct],
+                )
+
                 # Hooks - Single
+                def _run_seg_single_with_master(img, seg_chan, diameter, flow_th, cellprob_th, use_gpu, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m):
+                    return run_segmentation_single(img, seg_chan, diameter, flow_th, cellprob_th, use_gpu, bool(bg_en), bg_r, bool(nm_en), nm_m, bg_mode=bg_mode, bg_dark_pct=dark_pct)
+
                 s_run_seg_btn.click(
-                    fn=run_segmentation_single,
-                    inputs=[s_img, s_seg_chan, s_diameter, s_flow_th, s_cellprob_th, s_use_gpu, s_pp_bg_enable, s_pp_bg_radius, s_pp_norm_enable, s_pp_norm_method],
+                    fn=_run_seg_single_with_master,
+                    inputs=[s_img, s_seg_chan, s_diameter, s_flow_th, s_cellprob_th, s_use_gpu, s_pp_bg_enable, s_pp_bg_mode, s_pp_bg_radius, s_dark_pct, s_pp_norm_enable, s_pp_norm_method],
                     outputs=[s_seg_overlay, s_seg_tiff_file, s_mask_img, s_masks_state],
                 )
                 s_run_rad_btn.click(
@@ -1414,13 +1500,13 @@ def build_ui():
                     outputs=[s_rad_overlay, s_radial_mask_state, s_radial_label_state, s_rad_tiff, s_rad_lbl_tiff],
                 )
                 s_run_mask_btn.click(
-                    fn=lambda img, m, ch, sat, mode, p, mino, use_roi, roi_labels, name, bg_en, bg_r, nm_en, nm_m: apply_mask(img, m, ch, sat, mode, p, mino, roi_labels if use_roi else None, name, bg_en, bg_r, nm_en, nm_m),
-                    inputs=[s_img, s_masks_state, s_chan, s_sat_limit, s_mask_mode, s_pct, s_min_obj, s_use_radial_roi, s_radial_label_state, gr.State("single_mask"), s_pp_bg_enable, s_pp_bg_radius, s_pp_norm_enable, s_pp_norm_method],
+                    fn=lambda img, m, ch, sat, mode, p, mino, use_roi, roi_labels, name, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m: apply_mask(img, m, ch, sat, mode, p, mino, roi_labels if use_roi else None, name, bool(bg_en), (0 if bg_mode=='dark_subtract' else bg_r), bool(nm_en), nm_m),
+                    inputs=[s_img, s_masks_state, s_chan, s_sat_limit, s_mask_mode, s_pct, s_min_obj, s_use_radial_roi, s_radial_label_state, gr.State("single_mask"), s_pp_bg_enable, s_pp_bg_mode, s_pp_bg_radius, s_dark_pct, s_pp_norm_enable, s_pp_norm_method],
                     outputs=[s_mask_overlay, s_mask_tiff, s_mask_state],
                 )
                 s_quant_btn.click(
-                    fn=integrate_and_quantify_single,
-                    inputs=[s_img, s_masks_state, s_mask_state, s_chan, s_px_w, s_px_h, s_pp_bg_enable, s_pp_bg_radius, s_pp_norm_enable, s_pp_norm_method],
+                    fn=lambda img, ms, mbool, ch, pw, ph, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m: integrate_and_quantify_single(img, ms, mbool, ch, pw, ph, bool(bg_en), (0 if bg_mode=='dark_subtract' else bg_r), bool(nm_en), nm_m),
+                    inputs=[s_img, s_masks_state, s_mask_state, s_chan, s_px_w, s_px_h, s_pp_bg_enable, s_pp_bg_mode, s_pp_bg_radius, s_dark_pct, s_pp_norm_enable, s_pp_norm_method],
                     outputs=[s_final_overlay, s_mask_tiff, s_table, s_csv_file, s_img_on_mask],
                 )
 
@@ -1430,7 +1516,7 @@ def build_ui():
                     fn=None,
                     inputs=[],
                     outputs=[
-                        s_pp_bg_enable, s_pp_bg_radius, s_pp_norm_enable, s_pp_norm_method,
+                        s_pp_bg_enable, s_pp_bg_mode, s_pp_bg_radius, s_dark_pct, s_pp_norm_enable, s_pp_norm_method,
                         s_seg_chan, s_diameter, s_flow_th, s_cellprob_th, s_use_gpu,
                         s_rad_in, s_rad_out, s_rad_min_obj,
                         s_use_radial_roi,
@@ -1443,7 +1529,7 @@ def build_ui():
                         try {{
                             const raw = localStorage.getItem('{SINGLE_SETTINGS_KEY}');
                             const d = {{
-                                s_pp_bg_enable: false, s_pp_bg_radius: 50, s_pp_norm_enable: false, s_pp_norm_method: 'z-score',
+                                s_pp_bg_enable: false, s_pp_bg_mode: 'rolling', s_pp_bg_radius: 50, s_dark_pct: 5.0, s_pp_norm_enable: false, s_pp_norm_method: 'z-score',
                                 s_seg_chan: 'gray', s_diameter: 0, s_flow_th: 0.4, s_cellprob_th: 0.0, s_use_gpu: true,
                                 s_rad_in: 0.0, s_rad_out: 100.0, s_rad_min_obj: 50,
                                 s_use_radial_roi: false,
@@ -1456,7 +1542,7 @@ def build_ui():
                             s.s_seg_chan = mapChan(s.s_seg_chan);
                             s.s_chan = mapChan(s.s_chan);
                             return [
-                                s.s_pp_bg_enable, s.s_pp_bg_radius, s.s_pp_norm_enable, s.s_pp_norm_method,
+                                s.s_pp_bg_enable, s.s_pp_bg_mode, s.s_pp_bg_radius, s.s_dark_pct, s.s_pp_norm_enable, s.s_pp_norm_method,
                                 s.s_seg_chan, s.s_diameter, s.s_flow_th, s.s_cellprob_th, s.s_use_gpu,
                                 s.s_rad_in, s.s_rad_out, s.s_rad_min_obj,
                                 s.s_use_radial_roi,
@@ -1467,7 +1553,7 @@ def build_ui():
                         }} catch (e) {{
                             console.warn('Failed to load single settings:', e);
                             return [
-                                false, 50, false, 'z-score',
+                                false, 'rolling', 50, 5.0, false, 'z-score',
                                 'gray', 0, 0.4, 0.0, true,
                                 0.0, 100.0, 50,
                                 false,
@@ -1501,7 +1587,7 @@ def build_ui():
                     )
 
                 for comp, key in [
-                    (s_pp_bg_enable, 's_pp_bg_enable'), (s_pp_bg_radius, 's_pp_bg_radius'), (s_pp_norm_enable, 's_pp_norm_enable'), (s_pp_norm_method, 's_pp_norm_method'),
+                    (s_pp_bg_enable, 's_pp_bg_enable'), (s_pp_bg_mode, 's_pp_bg_mode'), (s_pp_bg_radius, 's_pp_bg_radius'), (s_dark_pct, 's_dark_pct'), (s_pp_norm_enable, 's_pp_norm_enable'), (s_pp_norm_method, 's_pp_norm_method'),
                     (s_seg_chan, 's_seg_chan'), (s_diameter, 's_diameter'), (s_flow_th, 's_flow_th'), (s_cellprob_th, 's_cellprob_th'), (s_use_gpu, 's_use_gpu'),
                     (s_rad_in, 's_rad_in'), (s_rad_out, 's_rad_out'), (s_rad_min_obj, 's_rad_min_obj'), (s_use_radial_roi, 's_use_radial_roi'),
                     (s_chan, 's_chan'), (s_mask_mode, 's_mask_mode'), (s_sat_limit, 's_sat_limit'), (s_pct, 's_pct'), (s_min_obj, 's_min_obj'),
@@ -1522,7 +1608,7 @@ def build_ui():
                     fn=None,
                     inputs=[],
                     outputs=[
-                        s_pp_bg_enable, s_pp_bg_radius, s_pp_norm_enable, s_pp_norm_method,
+                        s_pp_bg_enable, s_pp_bg_mode, s_pp_bg_radius, s_dark_pct, s_pp_norm_enable, s_pp_norm_method,
                         s_seg_chan, s_diameter, s_flow_th, s_cellprob_th, s_use_gpu,
                         s_rad_in, s_rad_out, s_rad_min_obj,
                         s_use_radial_roi,
@@ -1539,7 +1625,7 @@ def build_ui():
                         }}
                         alert('Single tab settings cleared.');
                         return [
-                            false, 50, false, 'z-score',
+                            false, 'rolling', 50, 5.0, false, 'z-score',
                             'gray', 0, 0.4, 0.0, true,
                             0.0, 100.0, 50,
                             false,
