@@ -1061,8 +1061,9 @@ def build_ui():
 
                 with gr.Row():
                     with gr.Column():
-                        tgt = gr.Image(type="pil", label="Target image", image_mode="RGB", width=600)
-                        ref = gr.Image(type="pil", label="Reference image", image_mode="RGB", width=600)
+                        with gr.Row():
+                            tgt = gr.Image(type="pil", label="Target image", image_mode="RGB", width=600)
+                            ref = gr.Image(type="pil", label="Reference image", image_mode="RGB", width=600)
 
                         with gr.Accordion("Preprocess (optional)", open=False):
                             pp_bg_enable = gr.Checkbox(value=False, label="Background correction")
@@ -1077,8 +1078,9 @@ def build_ui():
                                 "percentile [1,99]",
                             ], value="z-score", label="Normalization method")
                             pp_preview_btn = gr.Button("Preview preprocessed images")
-                            tgt_pp_img = gr.Image(type="pil", label="Preprocessed Target (preview)", width=600)
-                            ref_pp_img = gr.Image(type="pil", label="Preprocessed Reference (preview)", width=600)
+                            with gr.Row():
+                                tgt_pp_img = gr.Image(type="pil", label="Preprocessed Target (preview)", width=600)
+                                ref_pp_img = gr.Image(type="pil", label="Preprocessed Reference (preview)", width=600)
                             tgt_pp_tiff = gr.File(label="Download preprocessed Target (TIFF)")
                             ref_pp_tiff = gr.File(label="Download preprocessed Reference (TIFF)")
 
@@ -1093,8 +1095,9 @@ def build_ui():
                             cellprob_th = gr.Slider(-6.0, 6.0, value=0.0, step=0.1, label="Cellprob threshold")
                             use_gpu = gr.Checkbox(value=True, label="Use GPU if available")
                         run_seg_btn = gr.Button("1. Run Cellpose")
-                        seg_overlay = gr.Image(type="pil", label="Segmentation overlay",width=600)
-                        mask_img = gr.Image(type="pil", label="Segmentation label image",width=600)
+                        with gr.Row():
+                            seg_overlay = gr.Image(type="pil", label="Segmentation overlay",width=600)
+                            mask_img = gr.Image(type="pil", label="Segmentation label image",width=600)
                         seg_npy_state = gr.State()
                         seg_tiff_file = gr.File(label="Download masks (label TIFF)")
 
@@ -1144,9 +1147,10 @@ def build_ui():
                         table = gr.Dataframe(label="Per-cell intensities & ratios", interactive=False,pinned_columns=1)
                         csv_file = gr.File(label="Download CSV")
 
-                        tgt_on_and_img = gr.Image(type="pil", label="Target on AND mask", width=600)
-                        ref_on_and_img = gr.Image(type="pil", label="Reference on AND mask", width=600)
-                        ratio_img = gr.Image(type="pil", label="Ratio (Target/Reference) on AND mask", width=600)
+                        with gr.Row():
+                            tgt_on_and_img = gr.Image(type="pil", label="Target on AND mask", width=600)
+                            ref_on_and_img = gr.Image(type="pil", label="Reference on AND mask", width=600)
+                            ratio_img = gr.Image(type="pil", label="Ratio (Target/Reference) on AND mask", width=600)
                         ratio_npy_state = gr.State()
 
                         reset_settings = gr.Button("Reset saved settings")
