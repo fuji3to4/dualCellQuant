@@ -847,7 +847,8 @@ def build_ui():
                             radial_tar_overlay = gr.Image(type="pil", label="Integrate Target overlay (Radial AND mask)", width=600)
                             radial_ref_overlay = gr.Image(type="pil", label="Integrate Reference overlay (Radial AND mask)", width=600)
                         rad_tiff = gr.File(label="Download radial mask (TIFF)")
-                        rad_lbl_tiff = gr.File(label="Download radial labels (label TIFF)")
+                        # rad_lbl_tiff = gr.File(label="Download radial labels (label TIFF)")
+                        rad_lbl_tiff=gr.State()
                         radial_table = gr.Dataframe(label="Radial per-cell intensities & ratios", interactive=False, pinned_columns=1)
                         radial_csv = gr.File(label="Download radial CSV")
 
