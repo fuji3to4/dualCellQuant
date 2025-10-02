@@ -1358,26 +1358,38 @@ def build_ui():
                             prof_start = gr.Number(value=0.0, label="Start %", scale=1)
                             prof_end = gr.Number(value=150.0, label="End %", scale=1)
                             prof_step = gr.Number(value=5.0, label="Step %", scale=1)
+                        # Cache states for radial profile results (computed by 6.)
+                        prof_cache_df_state = gr.State()
+                        prof_cache_csv_state = gr.State()
+                        prof_cache_plot_state = gr.State()
+                        prof_cache_params_state = gr.State()
                         run_prof_btn = gr.Button("6. Compute Radial profile")
-                        
-                        with gr.Accordion("Label for single-cell profile", open=True):
-                                prof_label = gr.Number(value=1, label="Label for single-cell profile", scale=1)
-                        
+                        profile_table = gr.Dataframe(label="Radial profile (all cells)", interactive=False, pinned_columns=1)
+                        profile_csv = gr.File(label="Download radial profile CSV")
+                        # Single-cell / All selector
+                        with gr.Row():
+                            prof_label = gr.Dropdown(choices=["All"], value="All", label="Label for single-cell profile", allow_custom_value=False)
                         run_prof_single_btn = gr.Button("6b. Single-cell Radial profile (plot)")
-                        profile_table = gr.Dataframe(label="Radial profile (mean across cells)", interactive=False, pinned_columns=1)
-                        run_prof_all_btn = gr.Button("6c. Export all-cells Radial profile (CSV)")
-                        
                         
                         profile_plot = gr.Image(type="pil", label="Radial profile plot", width=800)
-                        profile_csv = gr.File(label="Download radial profile CSV")
+                        
 
                 # Segmentation
                 def _run_seg(tgt_img, ref_img, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu):
-                    return run_segmentation(tgt_img, ref_img, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu)
+                    ov, seg_tif, mask_viz, masks = run_segmentation(tgt_img, ref_img, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu)
+                    # Build dropdown choices for labels
+                    try:
+                        labs = np.unique(masks)
+                        labs = labs[labs > 0]
+                        choices = ["All"] + [str(int(l)) for l in labs]
+                    except Exception:
+                        choices = ["All"]
+                    # Reset radial-profile caches upon new segmentation
+                    return ov, seg_tif, mask_viz, masks, gr.update(choices=choices, value="All"), None, None, None, None
                 run_seg_btn.click(
                     fn=_run_seg,
                     inputs=[tgt, ref, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu],
-                    outputs=[seg_overlay, seg_tiff_file, mask_img, masks_state],
+                    outputs=[seg_overlay, seg_tiff_file, mask_img, masks_state, prof_label, prof_cache_df_state, prof_cache_csv_state, prof_cache_plot_state, prof_cache_params_state],
                 )
                 # Radial mask (now at bottom)
                 def _radial_and_quantify(tgt_img, ref_img, masks, rin, rout, mino, tmask, rmask, tchan, rchan, pw, ph, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m, man_t, man_r):
@@ -1404,52 +1416,159 @@ def build_ui():
                     bgm = str(bg_mode)
                     mt = float(man_t) if (bg_en and bgm == "manual") else None
                     mr = float(man_r) if (bg_en and bgm == "manual") else None
-                    df, csv_path, plot_img = radial_profile_analysis(
+                    # All-cells table + CSV
+                    df_all, csv_all = radial_profile_all_cells(
                         tgt_img, ref_img, masks, tchan, rchan,
                         float(s), float(e), float(st),
                         bool(bg_en), int(bg_r), bool(nm_en), nm_m,
                         bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
                         manual_tar_bg=mt, manual_ref_bg=mr,
                     )
-                    return df, csv_path, plot_img
+                    # Mean plot
+                    _, _, plot_img = radial_profile_analysis(
+                        tgt_img, ref_img, masks, tchan, rchan,
+                        float(s), float(e), float(st),
+                        bool(bg_en), int(bg_r), bool(nm_en), nm_m,
+                        bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
+                        manual_tar_bg=mt, manual_ref_bg=mr,
+                    )
+                    # Build cache params signature
+                    try:
+                        labs = np.unique(masks)
+                        labs = labs[labs > 0]
+                        lab_count = int(labs.size)
+                        lab_max = int(labs.max()) if lab_count > 0 else 0
+                        mshape = tuple(masks.shape)
+                    except Exception:
+                        lab_count = 0; lab_max = 0; mshape = None
+                    params = dict(
+                        tchan=str(tchan), rchan=str(rchan), start=float(s), end=float(e), step=float(st),
+                        bg_enable=bool(bg_en), bg_mode=str(bg_mode), bg_radius=int(bg_r), dark_pct=float(dark_pct),
+                        norm_enable=bool(nm_en), norm_method=str(nm_m),
+                        man_t=float(mt) if mt is not None else None, man_r=float(mr) if mr is not None else None,
+                        mask_shape=mshape, lab_count=lab_count, lab_max=lab_max,
+                    )
+                    return df_all, csv_all, plot_img, df_all, csv_all, plot_img, params
                 run_prof_btn.click(
                     fn=_radial_profile_cb,
                     inputs=[tgt, ref, masks_state, tgt_chan, ref_chan, prof_start, prof_end, prof_step, pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method, bak_tar, bak_ref],
-                    outputs=[profile_table, profile_csv, profile_plot],
+                    outputs=[profile_table, profile_csv, profile_plot, prof_cache_df_state, prof_cache_csv_state, prof_cache_plot_state, prof_cache_params_state],
                 )
-                def _radial_profile_single_cb(tgt_img, ref_img, masks, label, tchan, rchan, s, e, st, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m, man_t, man_r):
+                def _radial_profile_single_or_all_cb(tgt_img, ref_img, masks, label_val, tchan, rchan, s, e, st, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m, man_t, man_r, cache_df, cache_csv, cache_plot, cache_params):
                     bgm = str(bg_mode)
                     mt = float(man_t) if (bg_en and bgm == "manual") else None
                     mr = float(man_r) if (bg_en and bgm == "manual") else None
-                    df, csv_path, plot_img = radial_profile_single(
-                        tgt_img, ref_img, masks, int(label), tchan, rchan,
-                        float(s), float(e), float(st),
-                        bool(bg_en), int(bg_r), bool(nm_en), nm_m,
-                        bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
-                        manual_tar_bg=mt, manual_ref_bg=mr,
+                    # Build current params signature for cache matching
+                    try:
+                        labs_now = np.unique(masks)
+                        labs_now = labs_now[labs_now > 0]
+                        lab_count = int(labs_now.size)
+                        lab_max = int(labs_now.max()) if lab_count > 0 else 0
+                        mshape = tuple(masks.shape)
+                    except Exception:
+                        lab_count = 0; lab_max = 0; mshape = None
+                    cur_params = dict(
+                        tchan=str(tchan), rchan=str(rchan), start=float(s), end=float(e), step=float(st),
+                        bg_enable=bool(bg_en), bg_mode=str(bg_mode), bg_radius=int(bg_r), dark_pct=float(dark_pct),
+                        norm_enable=bool(nm_en), norm_method=str(nm_m),
+                        man_t=float(mt) if mt is not None else None, man_r=float(mr) if mr is not None else None,
+                        mask_shape=mshape, lab_count=lab_count, lab_max=lab_max,
                     )
-                    return plot_img, csv_path
+                    def params_equal(a, b):
+                        try:
+                            return a == b
+                        except Exception:
+                            return False
+                    if str(label_val) == "All":
+                        # If cache matches, just switch to cached All (no recompute)
+                        if (cache_df is not None) and (cache_plot is not None) and params_equal(cache_params, cur_params):
+                            return cache_df, cache_csv, cache_plot, cache_df, cache_csv, cache_plot, cache_params
+                        # Else recompute and refresh cache
+                        df_all, csv_all = radial_profile_all_cells(
+                            tgt_img, ref_img, masks, tchan, rchan,
+                            float(s), float(e), float(st),
+                            bool(bg_en), int(bg_r), bool(nm_en), nm_m,
+                            bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
+                            manual_tar_bg=mt, manual_ref_bg=mr,
+                        )
+                        _, _, plot_img = radial_profile_analysis(
+                            tgt_img, ref_img, masks, tchan, rchan,
+                            float(s), float(e), float(st),
+                            bool(bg_en), int(bg_r), bool(nm_en), nm_m,
+                            bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
+                            manual_tar_bg=mt, manual_ref_bg=mr,
+                        )
+                        return df_all, csv_all, plot_img, df_all, csv_all, plot_img, cur_params
+                    else:
+                        try:
+                            lab = int(str(label_val))
+                        except Exception:
+                            lab = None
+                        if lab is None:
+                            return gr.update(), None, None, cache_df, cache_csv, cache_plot, cache_params
+                        # Prefer cached all-cells DF for slicing if available and params match
+                        use_df = None
+                        if (cache_df is not None) and params_equal(cache_params, cur_params):
+                            use_df = cache_df
+                        else:
+                            # Recompute all-cells to fill cache (so subsequent switches are instant)
+                            use_df, csv_all = radial_profile_all_cells(
+                                tgt_img, ref_img, masks, tchan, rchan,
+                                float(s), float(e), float(st),
+                                bool(bg_en), int(bg_r), bool(nm_en), nm_m,
+                                bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
+                                manual_tar_bg=mt, manual_ref_bg=mr,
+                            )
+                            # Also compute All mean plot for completeness of cache
+                            _, _, cache_plot_new = radial_profile_analysis(
+                                tgt_img, ref_img, masks, tchan, rchan,
+                                float(s), float(e), float(st),
+                                bool(bg_en), int(bg_r), bool(nm_en), nm_m,
+                                bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
+                                manual_tar_bg=mt, manual_ref_bg=mr,
+                            )
+                            cache_df = use_df; cache_csv = csv_all; cache_plot = cache_plot_new; cache_params = cur_params
+                        # Slice single label rows
+                        try:
+                            df1 = use_df[use_df["label"] == int(lab)].copy()
+                        except Exception:
+                            # Fallback to direct compute for the label
+                            df1, csv1, plot1 = radial_profile_single(
+                                tgt_img, ref_img, masks, lab, tchan, rchan,
+                                float(s), float(e), float(st),
+                                bool(bg_en), int(bg_r), bool(nm_en), nm_m,
+                                bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
+                                manual_tar_bg=mt, manual_ref_bg=mr,
+                            )
+                            return df1, csv1, plot1, cache_df, cache_csv, cache_plot, cache_params
+                        # Write CSV for this label
+                        tmp_csv = tempfile.NamedTemporaryFile(delete=False, suffix=f"_radial_profile_label_{lab}.csv")
+                        df1.to_csv(tmp_csv.name, index=False)
+                        # Plot for this label based on df slice
+                        fig, ax1 = plt.subplots(figsize=(6, 4))
+                        ax1.plot(df1["center_pct"], df1["mean_target"], label=f"Target (L{lab})", color="tab:red")
+                        ax1.plot(df1["center_pct"], df1["mean_reference"], label=f"Reference (L{lab})", color="tab:blue")
+                        ax1.set_xlabel("Radial % (0=center, 100=boundary)")
+                        ax1.set_ylabel("Mean intensity")
+                        ax1.grid(True, alpha=0.3)
+                        ax2 = ax1.twinx()
+                        ax2.plot(df1["center_pct"], df1["mean_ratio_T_over_R"], label="T/R", color="tab:green", linestyle="--")
+                        ax2.set_ylabel("Mean ratio (T/R)")
+                        lines1, labels1 = ax1.get_legend_handles_labels()
+                        lines2, labels2 = ax2.get_legend_handles_labels()
+                        ax1.legend(lines1 + lines2, labels1 + labels2, loc="best")
+                        buf = io.BytesIO()
+                        fig.tight_layout()
+                        fig.savefig(buf, format="png", dpi=150)
+                        plt.close(fig)
+                        buf.seek(0)
+                        plot1 = Image.open(buf).copy()
+                        buf.close()
+                        return df1, tmp_csv.name, plot1, cache_df, cache_csv, cache_plot, cache_params
                 run_prof_single_btn.click(
-                    fn=_radial_profile_single_cb,
-                    inputs=[tgt, ref, masks_state, prof_label, tgt_chan, ref_chan, prof_start, prof_end, prof_step, pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method, bak_tar, bak_ref],
-                    outputs=[profile_plot, profile_csv],
-                )
-                def _radial_profile_all_cb(tgt_img, ref_img, masks, tchan, rchan, s, e, st, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m, man_t, man_r):
-                    bgm = str(bg_mode)
-                    mt = float(man_t) if (bg_en and bgm == "manual") else None
-                    mr = float(man_r) if (bg_en and bgm == "manual") else None
-                    df, csv_path = radial_profile_all_cells(
-                        tgt_img, ref_img, masks, tchan, rchan,
-                        float(s), float(e), float(st),
-                        bool(bg_en), int(bg_r), bool(nm_en), nm_m,
-                        bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
-                        manual_tar_bg=mt, manual_ref_bg=mr,
-                    )
-                    return df, csv_path
-                run_prof_all_btn.click(
-                    fn=_radial_profile_all_cb,
-                    inputs=[tgt, ref, masks_state, tgt_chan, ref_chan, prof_start, prof_end, prof_step, pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method, bak_tar, bak_ref],
-                    outputs=[profile_table, profile_csv],
+                    fn=_radial_profile_single_or_all_cb,
+                    inputs=[tgt, ref, masks_state, prof_label, tgt_chan, ref_chan, prof_start, prof_end, prof_step, pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method, bak_tar, bak_ref, prof_cache_df_state, prof_cache_csv_state, prof_cache_plot_state, prof_cache_params_state],
+                    outputs=[profile_table, profile_csv, profile_plot, prof_cache_df_state, prof_cache_csv_state, prof_cache_plot_state, prof_cache_params_state],
                 )
                 # Target/Reference masking (no ROI coupling)
                 def _apply_mask_generic(img, m, ch, sat, mode, p, mino, name):
