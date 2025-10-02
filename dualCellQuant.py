@@ -791,7 +791,7 @@ def build_ui():
                             ref = gr.Image(type="pil", label="Reference image", image_mode="RGB", width=600)
                         
                         with gr.Accordion("Settings", open=False):
-                            reset_settings = gr.Button("Reset saved settings")
+                            reset_settings = gr.Button("Reset Settings",scale=1)
                             label_scale = gr.Slider(0.0, 5.0, value=float(LABEL_SCALE), step=0.1, label="Label size scale (0=hidden)")
                         with gr.Accordion("Segmentation params", open=False):
                             seg_source = gr.Radio(["target","reference"], value="target", label="Segment on")
@@ -832,23 +832,27 @@ def build_ui():
                                 ref_overlay = gr.Image(type="pil", label="Reference mask overlay", width=600)
                                 ref_tiff = gr.File(label="Download reference mask (TIFF)")
                         with gr.Accordion("Integrate & Quantify", open=False):
-                            pp_bg_enable = gr.Checkbox(value=False, label="Background correction")
-                            pp_bg_mode = gr.Dropdown(["rolling","dark_subtract","manual"], value="dark_subtract", label="BG method")
-                            pp_bg_radius = gr.Slider(1, 300, value=50, step=1, label="Rolling ball radius (px)")
-                            pp_dark_pct = gr.Slider(0.0, 50.0, value=5.0, step=0.5, label="Dark percentile (%)")
-                            with gr.Row():
-                                bak_tar = gr.Number(value=1.0, label="Target background", scale=1)
-                                bak_ref = gr.Number(value=1.0, label="Reference background", scale=1)
-                            pp_norm_enable = gr.Checkbox(value=False, label="Normalization")
-                            pp_norm_method = gr.Dropdown([
-                                "z-score",
-                                "robust z-score",
-                                "min-max",
-                                "percentile [1,99]",
-                            ], value="min-max", label="Normalization method")
-                            with gr.Row():
-                                px_w = gr.Number(value=1.0, label="Pixel width (µm)", scale=1)
-                                px_h = gr.Number(value=1.0, label="Pixel height (µm)", scale=1)
+                            with gr.Column():
+                                pp_bg_enable = gr.Checkbox(value=False, label="Background correction")
+                                pp_bg_mode = gr.Dropdown(["rolling","dark_subtract","manual"], value="dark_subtract", label="BG method")
+                                pp_bg_radius = gr.Slider(1, 300, value=50, step=1, label="Rolling ball radius (px)")
+                                pp_dark_pct = gr.Slider(0.0, 50.0, value=5.0, step=0.5, label="Dark percentile (%)")
+                                
+                                with gr.Row():
+                                    bak_tar = gr.Number(value=1.0, label="Target background", scale=1)
+                                    bak_ref = gr.Number(value=1.0, label="Reference background", scale=1)
+                            with gr.Column():
+                                pp_norm_enable = gr.Checkbox(value=False, label="Normalization")
+                                pp_norm_method = gr.Dropdown([
+                                    "z-score",
+                                    "robust z-score",
+                                    "min-max",
+                                    "percentile [1,99]",
+                                ], value="min-max", label="Normalization method")
+                            with gr.Column():
+                                with gr.Row():
+                                    px_w = gr.Number(value=1.0, label="Pixel width (µm)", scale=1)
+                                    px_h = gr.Number(value=1.0, label="Pixel height (µm)", scale=1)
                         integrate_btn = gr.Button("4. Integrate & Quantify")
                         with gr.Row():
                             integrate_tar_overlay = gr.Image(type="pil", label="Integrate Target overlay (AND mask)", width=600)
@@ -941,13 +945,13 @@ def build_ui():
                 )
 
                 # Ensure initial visibility on app load after settings are restored
-                def _init_pct_vis(t_mode: str, r_mode: str):
-                    tm = (str(t_mode) if t_mode is not None else '').lower()
-                    rm = (str(r_mode) if r_mode is not None else '').lower()
-                    return (
-                        gr.update(visible=(tm in ("global_percentile", "per_cell_percentile"))),
-                        gr.update(visible=(rm in ("global_percentile", "per_cell_percentile"))),
-                    )
+                # def _init_pct_vis(t_mode: str, r_mode: str):
+                #     tm = (str(t_mode) if t_mode is not None else '').lower()
+                #     rm = (str(r_mode) if r_mode is not None else '').lower()
+                #     return (
+                #         gr.update(visible=(tm in ("global_percentile", "per_cell_percentile"))),
+                #         gr.update(visible=(rm in ("global_percentile", "per_cell_percentile"))),
+                #     )
                 # demo.load(
                 #     fn=_init_pct_vis,
                 #     inputs=[tgt_mask_mode, ref_mask_mode],
