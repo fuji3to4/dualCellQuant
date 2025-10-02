@@ -17,6 +17,9 @@ A stepwise Gradio app for per-cell quantification with Cellpose-SAM segmentation
   - Mean/Sum per mask and per whole cell
   - Target/Reference ratio image and CSV export
 - 🖼️ Clear overlays with cell IDs and downloadable NumPy arrays for all masks
+- 🧹 Optional Preprocess: Background correction (Rolling ball) and Normalization (z-score, robust z, min-max, percentile)
+  - Default: OFF
+  - Preview processed images and download 8-bit TIFFs
 
 ## Workflows ▶️
 
@@ -33,6 +36,12 @@ Outputs: label mask TIFF, mask TIFF, table CSV, image overlay previews.
 
 1. 🧩 Run Cellpose-SAM segmentation
 
+- (Optional) Preprocess
+  - Background correction (Rolling ball, radius in px)
+  - Normalization: z-score (default), robust z-score (median/MAD), min-max, percentile [1,99]
+  - Preview and download preprocessed images (8-bit TIFF)
+
+
 - Choose source image/channel and model thresholds
 - Outputs: label mask (.npy), overlays
 
@@ -47,6 +56,7 @@ Outputs: label mask TIFF, mask TIFF, table CSV, image overlay previews.
 - Choose channel, saturation limit, masking mode, percentile (if applicable), min object size
 - Optionally restrict to the Radial ROI (per-label)
 - Outputs: target mask (.npy), overlay
+  - Note: Saturation limit thresholding is computed on the original image intensities (0–1 scale) so that preprocessing does not affect saturation gating.
 
 ### 4. 📎 Apply Reference mask
 
@@ -57,6 +67,7 @@ Outputs: label mask TIFF, mask TIFF, table CSV, image overlay previews.
 
 - Optionally AND with Radial mask
 - Produces per-cell table (CSV), AND mask (.npy), and a Target/Reference ratio image (.npy and preview)
+  - If Preprocess is enabled, both visualization and measurement use the preprocessed arrays (for Dual/Single). For saturation gating in masking, the original image scale is used.
 
 ## UI Controls (by section) 🧰
 
@@ -75,6 +86,11 @@ Outputs: label mask TIFF, mask TIFF, table CSV, image overlay previews.
   - Same as Target
 - Integrate
   - AND with radial mask (toggle)
+
+- Preprocess (optional)
+  - Background correction (Rolling ball): radius in px
+  - Normalization method: z-score / robust z-score / min-max / percentile [1,99]
+  - Preview buttons and TIFF download of preprocessed images
 
 ## Key Implementation Notes 🛠️
 
