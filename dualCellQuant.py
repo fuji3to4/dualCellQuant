@@ -119,6 +119,7 @@ def background_correction(
     *,
     mode: str = "rolling",
     dark_pct: float = 5.0,
+    manual_value: float | None = None,
 ) -> np.ndarray:
     if not enabled:
         return arr
@@ -132,6 +133,21 @@ def background_correction(
             return ch
         m = float(np.mean(dark))
         return np.clip(ch - m, 0.0, None)
+
+    def _manual_subtract_2d(ch: np.ndarray, val: float | None) -> np.ndarray:
+        if val is None or not np.isfinite(val):
+            return ch
+        return np.clip(ch - float(val), 0.0, None)
+
+    if mode == "manual":
+        if arr.ndim == 2:
+            return _manual_subtract_2d(arr, manual_value)
+        if arr.ndim == 3 and arr.shape[2] >= 3:
+            chs = []
+            for i in range(3):
+                chs.append(_manual_subtract_2d(arr[:, :, i], manual_value))
+            return np.stack(chs, axis=2)
+        return arr
 
     if arr.ndim == 2:
         return _dark_subtract_2d(arr, dark_pct) if mode == "dark_subtract" else _apply_rolling_ball(arr, radius)
@@ -191,11 +207,31 @@ def preprocess_for_processing(
     bg_dark_pct: float = 5.0,
     norm_enable: bool = False,
     norm_method: str = "z-score",
+    manual_background: float | None = None,
 ) -> np.ndarray:
     arr = pil_to_numpy_native(img) if use_native_scale else pil_to_numpy(img)
-    arr = background_correction(arr, int(bg_radius), bool(bg_enable), mode=bg_mode, dark_pct=float(bg_dark_pct))
+    arr = background_correction(
+        arr, int(bg_radius), bool(bg_enable), mode=bg_mode, dark_pct=float(bg_dark_pct), manual_value=manual_background
+    )
     arr = normalize_array(arr, bool(norm_enable), norm_method)
     return arr.astype(np.float32, copy=False)
+
+
+def compute_dark_background(img: Image.Image, chan, pct: float, use_native_scale: bool = True) -> float:
+    arr = pil_to_numpy_native(img) if use_native_scale else pil_to_numpy(img)
+    if arr.ndim == 3 and arr.shape[2] >= 3:
+        ch = extract_single_channel(arr, chan)
+    else:
+        ch = arr.astype(np.float32, copy=False)
+    p = float(np.clip(pct, 0.0, 50.0))
+    try:
+        thr = float(np.percentile(ch, p))
+        dark = ch[ch <= thr]
+        if dark.size == 0:
+            return 0.0
+        return float(np.mean(dark))
+    except Exception:
+        return 0.0
 
 
 # -----------------------
@@ -573,6 +609,9 @@ def integrate_and_quantify(
     *,
     bg_mode: str = "rolling",
     bg_dark_pct: float = 5.0,
+    manual_tar_bg: float | None = None,
+    manual_ref_bg: float | None = None,
+    roi_mask: np.ndarray | None = None,
 ):
     if masks is None or tgt_mask is None or ref_mask is None:
         raise ValueError("Run previous steps first.")
@@ -581,11 +620,13 @@ def integrate_and_quantify(
         target_img, use_native_scale=False,
         bg_enable=pp_bg_enable, bg_radius=pp_bg_radius, bg_mode=bg_mode, bg_dark_pct=bg_dark_pct,
         norm_enable=pp_norm_enable, norm_method=pp_norm_method,
+        manual_background=manual_tar_bg,
     )
     ref_vis = preprocess_for_processing(
         reference_img, use_native_scale=False,
         bg_enable=pp_bg_enable, bg_radius=pp_bg_radius, bg_mode=bg_mode, bg_dark_pct=bg_dark_pct,
         norm_enable=pp_norm_enable, norm_method=pp_norm_method,
+        manual_background=manual_ref_bg,
     )
     if tgt_vis.shape[:2] != ref_vis.shape[:2]:
         raise ValueError("Image size mismatch between target and reference")
@@ -594,17 +635,21 @@ def integrate_and_quantify(
         target_img, use_native_scale=True,
         bg_enable=pp_bg_enable, bg_radius=pp_bg_radius, bg_mode=bg_mode, bg_dark_pct=bg_dark_pct,
         norm_enable=pp_norm_enable, norm_method=pp_norm_method,
+        manual_background=manual_tar_bg,
     )
     ref_nat = preprocess_for_processing(
         reference_img, use_native_scale=True,
         bg_enable=pp_bg_enable, bg_radius=pp_bg_radius, bg_mode=bg_mode, bg_dark_pct=bg_dark_pct,
         norm_enable=pp_norm_enable, norm_method=pp_norm_method,
+        manual_background=manual_ref_bg,
     )
     tgt_gray_vis = extract_single_channel(tgt_vis, tgt_chan)
     ref_gray_vis = extract_single_channel(ref_vis, ref_chan)
     tgt_gray_nat = extract_single_channel(tgt_nat, tgt_chan)
     ref_gray_nat = extract_single_channel(ref_nat, ref_chan)
     and_mask = tgt_mask & ref_mask
+    if roi_mask is not None:
+        and_mask = and_mask & roi_mask
     labels = np.unique(masks); labels = labels[labels > 0]
     try:
         px_area_um2 = float(pixel_width_um) * float(pixel_height_um)
@@ -667,8 +712,10 @@ def integrate_and_quantify(
         df = df[["label"] + [c for c in df.columns if c != "label"]]
     tmp_csv = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
     df.to_csv(tmp_csv.name, index=False)
-    overlay = colorize_overlay(tgt_gray_vis, masks, and_mask)
-    overlay = annotate_ids(overlay, masks)
+    overlay_tar = colorize_overlay(tgt_gray_vis, masks, and_mask)
+    overlay_tar = annotate_ids(overlay_tar, masks)
+    overlay_ref = colorize_overlay(ref_gray_vis, masks, and_mask)
+    overlay_ref = annotate_ids(overlay_ref, masks)
     and_tiff = save_bool_mask_tiff(and_mask, "and_mask")
     tgt_on_and = Image.fromarray((np.clip(np.where(and_mask, tgt_gray_vis, 0.0), 0, 1) * 255).astype(np.uint8))
     ref_on_and = Image.fromarray((np.clip(np.where(and_mask, ref_gray_vis, 0.0), 0, 1) * 255).astype(np.uint8))
@@ -685,7 +732,7 @@ def integrate_and_quantify(
     else:
         ratio_norm = np.zeros_like(ratio_masked, dtype=np.float32)
     ratio_overlay = Image.fromarray((np.nan_to_num(ratio_norm, nan=0.0) * 255).astype(np.uint8))
-    return overlay, and_tiff, df, tmp_csv.name, tgt_on_and, ref_on_and, ratio_overlay
+    return overlay_tar, overlay_ref, and_tiff, df, tmp_csv.name, tgt_on_and, ref_on_and, ratio_overlay
 
 
 # -----------------------
@@ -733,40 +780,54 @@ def build_ui():
                             mask_img = gr.Image(type="pil", label="Segmentation label image", width=600)
                         seg_tiff_file = gr.File(label="Download masks (label TIFF)")
                         # Radial mask controls are moved to the bottom (after Integrate)
-                        with gr.Accordion("Target mask", open=False):
-                            tgt_chan = gr.Radio(["gray","R","G","B"], value="gray", label="Target channel")
-                            tgt_mask_mode = gr.Radio(["none","global_percentile","global_otsu","per_cell_percentile","per_cell_otsu"], value="global_percentile", label="Masking mode")
-                            tgt_sat_limit = gr.Slider(0, 255, value=254, step=1, label="Saturation limit (abs, 8-bit scale)")
-                            tgt_pct = gr.Slider(0.0, 100.0, value=75.0, step=1.0, label="Percentile (Top p%)")
-                            tgt_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
-                        run_tgt_btn = gr.Button("2. Apply Target mask")
-                        tgt_overlay = gr.Image(type="pil", label="Target mask overlay", width=600)
-                        tgt_tiff = gr.File(label="Download target mask (TIFF)")
-                        with gr.Accordion("Reference mask", open=False):
-                            ref_chan = gr.Radio(["gray","R","G","B"], value="gray", label="Reference channel")
-                            ref_mask_mode = gr.Radio(["none","global_percentile","global_otsu","per_cell_percentile","per_cell_otsu"], value="global_percentile", label="Masking mode")
-                            ref_sat_limit = gr.Slider(0, 255, value=254, step=1, label="Saturation limit (abs, 8-bit scale)")
-                            ref_pct = gr.Slider(0.0, 100.0, value=75.0, step=1.0, label="Percentile (Top p%)")
-                            ref_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
-                        run_ref_btn = gr.Button("3. Apply Reference mask")
-                        ref_overlay = gr.Image(type="pil", label="Reference mask overlay", width=600)
-                        ref_tiff = gr.File(label="Download reference mask (TIFF)")
+                        with gr.Accordion("Apply mask", open=False):
+                            with gr.Row():
+                                with gr.Column():
+                                    gr.Markdown("**Target mask settings**")
+                                    tgt_chan = gr.Radio(["gray","R","G","B"], value="gray", label="Target channel")
+                                    tgt_mask_mode = gr.Dropdown(["none","global_percentile","global_otsu","per_cell_percentile","per_cell_otsu"], value="global_percentile", label="Masking mode")
+                                    tgt_pct = gr.Slider(0.0, 100.0, value=75.0, step=1.0, label="Percentile (Top p%)")
+                                    tgt_sat_limit = gr.Slider(0, 255, value=254, step=1, label="Saturation limit (abs, 8-bit scale)")
+                                    tgt_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
+                                with gr.Column():
+                                    gr.Markdown("**Reference mask settings**")
+                                    ref_chan = gr.Radio(["gray","R","G","B"], value="gray", label="Reference channel")
+                                    ref_mask_mode = gr.Dropdown(["none","global_percentile","global_otsu","per_cell_percentile","per_cell_otsu"], value="global_percentile", label="Masking mode")
+                                    ref_pct = gr.Slider(0.0, 100.0, value=75.0, step=1.0, label="Percentile (Top p%)")
+                                    ref_sat_limit = gr.Slider(0, 255, value=254, step=1, label="Saturation limit (abs, 8-bit scale)")
+                                    ref_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
+                        run_tgt_btn = gr.Button("2. Apply Target & Reference masks")
+                        with gr.Row():
+                            with gr.Column():
+                                tgt_overlay = gr.Image(type="pil", label="Target mask overlay", width=600)
+                                tgt_tiff = gr.File(label="Download target mask (TIFF)")
+
+                            with gr.Column():
+                                ref_overlay = gr.Image(type="pil", label="Reference mask overlay", width=600)
+                                ref_tiff = gr.File(label="Download reference mask (TIFF)")
                         with gr.Accordion("Integrate & Quantify", open=False):
-                            pp_bg_enable = gr.Checkbox(value=False, label="Background correction (apply at integrate)")
-                            pp_bg_mode = gr.Dropdown(["rolling","dark_subtract"], value="rolling", label="BG method")
+                            pp_bg_enable = gr.Checkbox(value=False, label="Background correction")
+                            pp_bg_mode = gr.Dropdown(["rolling","dark_subtract","manual"], value="dark_subtract", label="BG method")
                             pp_bg_radius = gr.Slider(1, 300, value=50, step=1, label="Rolling ball radius (px)")
                             pp_dark_pct = gr.Slider(0.0, 50.0, value=5.0, step=0.5, label="Dark percentile (%)")
-                            pp_norm_enable = gr.Checkbox(value=False, label="Normalization (apply at integrate)")
+                            with gr.Row():
+                                bak_tar = gr.Number(value=1.0, label="Target background", scale=1)
+                                bak_ref = gr.Number(value=1.0, label="Reference background", scale=1)
+                            pp_norm_enable = gr.Checkbox(value=False, label="Normalization")
                             pp_norm_method = gr.Dropdown([
                                 "z-score",
                                 "robust z-score",
                                 "min-max",
                                 "percentile [1,99]",
-                            ], value="z-score", label="Normalization method")
-                            integrate_btn = gr.Button("4. Integrate & Quantify")
-                        px_w = gr.Number(value=1.0, label="Pixel width (µm)")
-                        px_h = gr.Number(value=1.0, label="Pixel height (µm)")
-                        final_overlay = gr.Image(type="pil", label="Final overlay (AND mask)", width=600)
+                            ], value="min-max", label="Normalization method")
+                            with gr.Row():
+                                px_w = gr.Number(value=1.0, label="Pixel width (µm)", scale=1)
+                                px_h = gr.Number(value=1.0, label="Pixel height (µm)", scale=1)
+                        integrate_btn = gr.Button("4. Integrate & Quantify")
+                        with gr.Row():
+                            integrate_tar_overlay = gr.Image(type="pil", label="Integrate Target overlay (AND mask)", width=600)
+                            integrate_ref_overlay = gr.Image(type="pil", label="Integrate Reference overlay (AND mask)", width=600)
+
                         mask_tiff = gr.File(label="Download AND mask (TIFF)")
                         table = gr.Dataframe(label="Per-cell intensities & ratios", interactive=False, pinned_columns=1)
                         csv_file = gr.File(label="Download CSV")
@@ -780,9 +841,20 @@ def build_ui():
                             rad_out = gr.Slider(0.0, 120.0, value=100.0, step=1.0, label="Radial outer % (100=境界)")
                             rad_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
                         run_rad_btn = gr.Button("5. Build Radial mask")
-                        rad_overlay = gr.Image(type="pil", label="Radial mask overlay", width=600)
+                        # rad_overlay = gr.Image(type="pil", label="Radial mask overlay", width=600)
+                        rad_overlay=gr.State()
+                        with gr.Row():
+                            radial_tar_overlay = gr.Image(type="pil", label="Integrate Target overlay (Radial AND mask)", width=600)
+                            radial_ref_overlay = gr.Image(type="pil", label="Integrate Reference overlay (Radial AND mask)", width=600)
                         rad_tiff = gr.File(label="Download radial mask (TIFF)")
                         rad_lbl_tiff = gr.File(label="Download radial labels (label TIFF)")
+                        radial_table = gr.Dataframe(label="Radial per-cell intensities & ratios", interactive=False, pinned_columns=1)
+                        radial_csv = gr.File(label="Download radial CSV")
+
+                        with gr.Row():
+                            radial_tgt_on_and_img = gr.Image(type="pil", label="Target on Radial AND mask", width=600)
+                            radial_ref_on_and_img = gr.Image(type="pil", label="Reference on Radial AND mask", width=600)
+                            radial_ratio_img = gr.Image(type="pil", label="Ratio (Target/Reference) on Radial AND mask", width=600)
                         
 
                 # Segmentation
@@ -794,43 +866,110 @@ def build_ui():
                     outputs=[seg_overlay, seg_tiff_file, mask_img, masks_state],
                 )
                 # Radial mask (now at bottom)
+                def _radial_and_quantify(tgt_img, ref_img, masks, rin, rout, mino, tmask, rmask, tchan, rchan, pw, ph, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m, man_t, man_r):
+                    ov, rad_bool, rad_lbl, tiff_bool, tiff_lbl = radial_mask(masks, rin, rout, mino)
+                    # choose manual backgrounds only when mode is manual
+                    bgm = str(bg_mode)
+                    mt = float(man_t) if (bg_en and bgm == "manual") else None
+                    mr = float(man_r) if (bg_en and bgm == "manual") else None
+                    q_tar_ov, q_ref_ov, q_and_tiff, q_df, q_csv, q_tgt_on, q_ref_on, q_ratio = integrate_and_quantify(
+                        tgt_img, ref_img, masks, tmask, rmask, tchan, rchan, pw, ph,
+                        bool(bg_en), int(bg_r), bool(nm_en), nm_m,
+                        bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
+                        manual_tar_bg=mt, manual_ref_bg=mr, roi_mask=rad_bool,
+                    )
+                    return ov, rad_bool, rad_lbl, tiff_bool, tiff_lbl, q_df, q_csv, q_tar_ov, q_ref_ov, q_tgt_on, q_ref_on, q_ratio
                 run_rad_btn.click(
-                    fn=radial_mask,
-                    inputs=[masks_state, rad_in, rad_out, rad_min_obj],
-                    outputs=[rad_overlay, radial_mask_state, radial_label_state, rad_tiff, rad_lbl_tiff],
+                    fn=_radial_and_quantify,
+                    inputs=[tgt, ref, masks_state, rad_in, rad_out, rad_min_obj, tgt_mask_state, ref_mask_state, tgt_chan, ref_chan, px_w, px_h, pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method, bak_tar, bak_ref],
+                    outputs=[rad_overlay, radial_mask_state, radial_label_state, rad_tiff, rad_lbl_tiff, radial_table, radial_csv, radial_tar_overlay, radial_ref_overlay, radial_tgt_on_and_img, radial_ref_on_and_img, radial_ratio_img],
                 )
                 # Target/Reference masking (no ROI coupling)
                 def _apply_mask_generic(img, m, ch, sat, mode, p, mino, name):
                     return apply_mask(img, m, ch, sat, mode, p, mino, None, name)
+                # Combined: apply both masks in one click from the Target button
+                def _apply_masks_both(tgt_img, ref_img, m, t_ch, t_sat, t_mode, t_p, t_mino, r_ch, r_sat, r_mode, r_p, r_mino):
+                    t_ov, t_tiff_path, t_mask = apply_mask(tgt_img, m, t_ch, t_sat, t_mode, t_p, t_mino, None, "target_mask")
+                    r_ov, r_tiff_path, r_mask = apply_mask(ref_img, m, r_ch, r_sat, r_mode, r_p, r_mino, None, "reference_mask")
+                    return t_ov, t_tiff_path, t_mask, r_ov, r_tiff_path, r_mask
                 run_tgt_btn.click(
-                    fn=_apply_mask_generic,
-                    inputs=[tgt, masks_state, tgt_chan, tgt_sat_limit, tgt_mask_mode, tgt_pct, tgt_min_obj, gr.State("target_mask")],
-                    outputs=[tgt_overlay, tgt_tiff, tgt_mask_state],
+                    fn=_apply_masks_both,
+                    inputs=[tgt, ref, masks_state, tgt_chan, tgt_sat_limit, tgt_mask_mode, tgt_pct, tgt_min_obj, ref_chan, ref_sat_limit, ref_mask_mode, ref_pct, ref_min_obj],
+                    outputs=[tgt_overlay, tgt_tiff, tgt_mask_state, ref_overlay, ref_tiff, ref_mask_state],
                 )
-                run_ref_btn.click(
-                    fn=_apply_mask_generic,
-                    inputs=[ref, masks_state, ref_chan, ref_sat_limit, ref_mask_mode, ref_pct, ref_min_obj, gr.State("reference_mask")],
-                    outputs=[ref_overlay, ref_tiff, ref_mask_state],
+
+                # Toggle percentile slider visibility based on mask mode
+                def _toggle_pct_vis(mode: str):
+                    m = (str(mode) if mode is not None else '').lower()
+                    return gr.update(visible=(m in ("global_percentile", "per_cell_percentile")))
+                tgt_mask_mode.change(
+                    fn=_toggle_pct_vis,
+                    inputs=[tgt_mask_mode],
+                    outputs=[tgt_pct],
                 )
+                ref_mask_mode.change(
+                    fn=_toggle_pct_vis,
+                    inputs=[ref_mask_mode],
+                    outputs=[ref_pct],
+                )
+
+                # Ensure initial visibility on app load after settings are restored
+                def _init_pct_vis(t_mode: str, r_mode: str):
+                    tm = (str(t_mode) if t_mode is not None else '').lower()
+                    rm = (str(r_mode) if r_mode is not None else '').lower()
+                    return (
+                        gr.update(visible=(tm in ("global_percentile", "per_cell_percentile"))),
+                        gr.update(visible=(rm in ("global_percentile", "per_cell_percentile"))),
+                    )
+                # demo.load(
+                #     fn=_init_pct_vis,
+                #     inputs=[tgt_mask_mode, ref_mask_mode],
+                #     outputs=[tgt_pct, ref_pct],
+                # )
+
                 def _pp_bg_mode_changed_int(mode: str):
                     m = (mode or "rolling").lower()
-                    return gr.update(visible=(m == "rolling")), gr.update(visible=(m == "dark_subtract"))
+                    return (
+                        gr.update(visible=(m == "rolling")),
+                        gr.update(visible=(m == "dark_subtract")),
+                        gr.update(visible=(m in ("manual", "dark_subtract"))),
+                        gr.update(visible=(m in ("manual", "dark_subtract"))),
+                    )
                 pp_bg_mode.change(
                     fn=_pp_bg_mode_changed_int,
                     inputs=[pp_bg_mode],
-                    outputs=[pp_bg_radius, pp_dark_pct],
+                    outputs=[pp_bg_radius, pp_dark_pct, bak_tar, bak_ref],
                 )
-                def _integrate_callback(tgt_img, ref_img, ms, tmask, rmask, tchan, rchan, pw, ph, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m):
-                    return integrate_and_quantify(
+                def _integrate_callback(tgt_img, ref_img, ms, tmask, rmask, tchan, rchan, pw, ph, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m, man_t, man_r):
+                    # Decide manual backgrounds and display values
+                    bg_mode_s = str(bg_mode)
+                    out_tar_bg = man_t
+                    out_ref_bg = man_r
+                    if str(bg_en).lower() in ("true", "1") and bg_mode_s == "dark_subtract":
+                        try:
+                            out_tar_bg = compute_dark_background(tgt_img, tchan, float(dark_pct), use_native_scale=True)
+                        except Exception:
+                            out_tar_bg = man_t
+                        try:
+                            out_ref_bg = compute_dark_background(ref_img, rchan, float(dark_pct), use_native_scale=True)
+                        except Exception:
+                            out_ref_bg = man_r
+                    # Prepare manual values to pass
+                    man_t = float(out_tar_bg) if (bg_en and bg_mode_s == "manual") else None
+                    man_r = float(out_ref_bg) if (bg_en and bg_mode_s == "manual") else None
+                    res = integrate_and_quantify(
                         tgt_img, ref_img, ms, tmask, rmask, tchan, rchan,
                         pw, ph,
                         bool(bg_en), int(bg_r), bool(nm_en), nm_m,
                         bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
+                        manual_tar_bg=man_t, manual_ref_bg=man_r,
                     )
+                    # Append background values to outputs so UI updates
+                    return (*res, out_tar_bg, out_ref_bg)
                 integrate_btn.click(
                     fn=_integrate_callback,
-                    inputs=[tgt, ref, masks_state, tgt_mask_state, ref_mask_state, tgt_chan, ref_chan, px_w, px_h, pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method],
-                    outputs=[final_overlay, mask_tiff, table, csv_file, tgt_on_and_img, ref_on_and_img, ratio_img],
+                    inputs=[tgt, ref, masks_state, tgt_mask_state, ref_mask_state, tgt_chan, ref_chan, px_w, px_h, pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method, bak_tar, bak_ref],
+                    outputs=[integrate_tar_overlay, integrate_ref_overlay, mask_tiff, table, csv_file, tgt_on_and_img, ref_on_and_img, ratio_img, bak_tar, bak_ref],
                 )
 
                 # ---------------- Persist settings (Dual) ----------------
