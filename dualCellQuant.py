@@ -1388,6 +1388,7 @@ def build_ui():
                 ref_mask_state = gr.State()
                 with gr.Row():
                     with gr.Column():
+                        gr.Markdown("## Input Images")
                         with gr.Row():
                             tgt = gr.Image(type="pil", label="Target image", image_mode="RGB", width=600)
                             ref = gr.Image(type="pil", label="Reference image", image_mode="RGB", width=600)
@@ -1395,19 +1396,23 @@ def build_ui():
                         with gr.Accordion("Settings", open=False):
                             reset_settings = gr.Button("Reset Settings",scale=1)
                             label_scale = gr.Slider(0.0, 5.0, value=float(LABEL_SCALE), step=0.1, label="Label size scale (0=hidden)")
+                        gr.Markdown("## 1. Run Cellpose-SAM Segmentation")
                         with gr.Accordion("Segmentation params", open=True):
                             seg_source = gr.Radio(["target","reference"], value="target", label="Segment on")
                             seg_chan = gr.Radio(["gray","R","G","B"], value="gray", label="Segmentation channel")
                             diameter = gr.Slider(0, 200, value=0, step=1, label="Diameter (px, 0=auto)")
                             flow_th = gr.Slider(0.0, 1.5, value=0.4, step=0.05, label="Flow threshold")
                             cellprob_th = gr.Slider(-6.0, 6.0, value=0.0, step=0.1, label="Cellprob threshold")
-                            use_gpu = gr.Checkbox(value=True, label="Use GPU if available")
+                            use_gpu = gr.Checkbox(value=True, label="Use GPU if available")           
+                                
                         run_seg_btn = gr.Button("1. Run Cellpose")
+                        
                         with gr.Row():
                             seg_overlay = gr.Image(type="pil", label="Segmentation overlay", width=600)
                             mask_img = gr.Image(type="pil", label="Segmentation label image", width=600)
                         seg_tiff_file = gr.File(label="Download masks (label TIFF)")
                         # Radial mask controls are moved to the bottom (after Integrate)
+                        gr.Markdown("## 2. Apply Masks")
                         with gr.Accordion("Apply mask", open=True):
                             with gr.Row():
                                 with gr.Column():
@@ -1424,7 +1429,9 @@ def build_ui():
                                     ref_pct = gr.Slider(0.0, 100.0, value=75.0, step=1.0, label="Percentile (Top p%)")
                                     ref_sat_limit = gr.Slider(0, 255, value=254, step=1, label="Saturation limit (abs, 8-bit scale)")
                                     ref_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
+                        
                         run_tgt_btn = gr.Button("2. Apply Target & Reference masks")
+                        
                         with gr.Row():
                             with gr.Column():
                                 tgt_overlay = gr.Image(type="pil", label="Target mask overlay", width=600)
@@ -1433,6 +1440,7 @@ def build_ui():
                             with gr.Column():
                                 ref_overlay = gr.Image(type="pil", label="Reference mask overlay", width=600)
                                 ref_tiff = gr.File(label="Download reference mask (TIFF)")
+                        gr.Markdown("## 4. Integrate & Quantify")
                         with gr.Accordion("Integrate & Quantify", open=True):
                             with gr.Column():
                                 pp_bg_enable = gr.Checkbox(value=False, label="Background correction")
@@ -1455,7 +1463,9 @@ def build_ui():
                                 with gr.Row():
                                     px_w = gr.Number(value=1.0, label="Pixel width (µm)", scale=1)
                                     px_h = gr.Number(value=1.0, label="Pixel height (µm)", scale=1)
+                        
                         integrate_btn = gr.Button("4. Integrate & Quantify")
+                        
                         with gr.Row():
                             integrate_tar_overlay = gr.Image(type="pil", label="Integrate Target overlay (AND mask)", width=600)
                             integrate_ref_overlay = gr.Image(type="pil", label="Integrate Reference overlay (AND mask)", width=600)
@@ -1467,14 +1477,18 @@ def build_ui():
                             tgt_on_and_img = gr.Image(type="pil", label="Target on AND mask", width=600)
                             ref_on_and_img = gr.Image(type="pil", label="Reference on AND mask", width=600)
                             ratio_img = gr.Image(type="pil", label="Ratio (Target/Reference) on AND mask", width=600)
+                            
+                        gr.Markdown("## 5. Build Radial Mask & Quantify")
                         # Radial mask section moved here (after integration)
                         with gr.Accordion("Radial mask (optional, after integration)", open=True):
                             rad_in = gr.Slider(0.0, 150.0, value=0.0, step=1.0, label="Radial inner % (0=中心)")
                             rad_out = gr.Slider(0.0, 150.0, value=100.0, step=1.0, label="Radial outer % (100=境界)")
                             rad_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
+
                         run_rad_btn = gr.Button("5. Build Radial mask & Quantify")
                         # rad_overlay = gr.Image(type="pil", label="Radial mask overlay", width=600)
                         rad_overlay=gr.State()
+                        
                         with gr.Row():
                             radial_tar_overlay = gr.Image(type="pil", label="Integrate Target overlay (Radial AND mask)", width=600)
                             radial_ref_overlay = gr.Image(type="pil", label="Integrate Reference overlay (Radial AND mask)", width=600)
@@ -1488,6 +1502,7 @@ def build_ui():
                             radial_tgt_on_and_img = gr.Image(type="pil", label="Target on Radial AND mask", width=600)
                             radial_ref_on_and_img = gr.Image(type="pil", label="Reference on Radial AND mask", width=600)
                             radial_ratio_img = gr.Image(type="pil", label="Ratio (Target/Reference) on Radial AND mask", width=600)
+                        gr.Markdown("## 6. Radial Intensity Profile")
                         # Radial profile (banded) section
                         with gr.Accordion("Radial intensity profile", open=True):
                             prof_start = gr.Number(value=0.0, label="Start %", scale=1)
@@ -1500,7 +1515,9 @@ def build_ui():
                         prof_cache_csv_state = gr.State()
                         prof_cache_plot_state = gr.State()
                         prof_cache_params_state = gr.State()
+                        
                         run_prof_btn = gr.Button("6. Compute Radial profile")
+                        
                         profile_table = gr.Dataframe(label="Radial profile (all cells)", interactive=False, pinned_columns=1)
                         profile_csv = gr.File(label="Download radial profile CSV")
                         # Single-cell / All selector
