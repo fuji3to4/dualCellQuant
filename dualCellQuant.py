@@ -586,7 +586,8 @@ def radial_profile_analysis(
     ref_chan: int,
     start_pct: float,
     end_pct: float,
-    step_pct: float,
+    window_size_pct: float,
+    window_step_pct: float,
     pp_bg_enable: bool,
     pp_bg_radius: int,
     pp_norm_enable: bool,
@@ -621,34 +622,38 @@ def radial_profile_analysis(
     tgt_gray = extract_single_channel(tgt_nat, tgt_chan)
     ref_gray = extract_single_channel(ref_nat, ref_chan)
 
-    # Clamp band settings
-    s = float(start_pct); e = float(end_pct); st = float(step_pct)
-    if st <= 0:
-        st = 5.0
-    if e < s:
-        s, e = e, s
-    # Build bin edges in normalized units
-    # Include the end edge to close the last bin
-    edges_pct = np.arange(s, e + 1e-6, st, dtype=float)
-    if edges_pct[-1] < e:
-        edges_pct = np.append(edges_pct, e)
-    edges = edges_pct / 100.0
-    nbins = max(0, len(edges) - 1)
-    if nbins == 0:
-        raise ValueError("Invalid band settings: no bins formed")
+    # Clamp window settings
+    s = float(start_pct); e = float(end_pct)
+    wsize = float(window_size_pct); wstep = float(window_step_pct)
+    if wsize <= 0: wsize = 10.0
+    if wstep <= 0: wstep = 5.0
+    if e < s: s, e = e, s
+    
+    # Generate window starts from s to e-wsize (inclusive) with step wstep
+    window_starts = []
+    current = s
+    while current <= e - wsize + 1e-6:
+        window_starts.append(current)
+        current += wstep
+    
+    if len(window_starts) == 0:
+        raise ValueError(f"Invalid window settings: no windows formed (start={s}, end={e}, size={wsize}, step={wstep})")
+    
+    windows = [(start, start + wsize) for start in window_starts]
+    nwindows = len(windows)
 
     # Precompute outside distance and nearest labels for extension >100%
     fg = masks > 0
     dist_bg, idx = ndi.distance_transform_edt(~fg, return_indices=True)
     nearest_label = masks[idx[0], idx[1]]
 
-    # Accumulators per bin
-    sum_t = np.zeros(nbins, dtype=np.float64)
-    sum_r = np.zeros(nbins, dtype=np.float64)
-    cnt = np.zeros(nbins, dtype=np.int64)
+    # Accumulators per window
+    sum_t = np.zeros(nwindows, dtype=np.float64)
+    sum_r = np.zeros(nwindows, dtype=np.float64)
+    cnt = np.zeros(nwindows, dtype=np.int64)
     # second moment for std
-    sum_t2 = np.zeros(nbins, dtype=np.float64)
-    sum_r2 = np.zeros(nbins, dtype=np.float64)
+    sum_t2 = np.zeros(nwindows, dtype=np.float64)
+    sum_r2 = np.zeros(nwindows, dtype=np.float64)
 
     # Loop per cell, compute inside/outside normalized radii and accumulate
     for lab in labels:
@@ -669,19 +674,15 @@ def radial_profile_analysis(
         else:
             tout = None
 
-        # Accumulate per bin
-        for k in range(nbins):
-            a = edges[k]; b = edges[k+1]
-            # include right edge in last bin
-            if k == nbins - 1:
-                idx_in = cell & (tin >= a) & (tin <= b)
-            else:
-                idx_in = cell & (tin >= a) & (tin < b)
+        # Accumulate per window
+        for k in range(nwindows):
+            a_pct, b_pct = windows[k]
+            a = a_pct / 100.0
+            b = b_pct / 100.0
+            # include both endpoints for the window
+            idx_in = cell & (tin >= a) & (tin <= b)
             if tout is not None:
-                if k == nbins - 1:
-                    idx_out = out_lab & (tout >= a) & (tout <= b)
-                else:
-                    idx_out = out_lab & (tout >= a) & (tout < b)
+                idx_out = out_lab & (tout >= a) & (tout <= b)
             else:
                 idx_out = None
             if idx_out is not None:
@@ -700,7 +701,7 @@ def radial_profile_analysis(
             sum_r2[k] += float(np.sum(vals_r.astype(np.float64) ** 2))
 
     # Build results
-    center_pct = (edges_pct[:-1] + edges_pct[1:]) / 2.0
+    center_pct = np.array([(a + b) / 2.0 for a, b in windows])
     mean_t = np.where(cnt > 0, sum_t / cnt, np.nan)
     mean_r = np.where(cnt > 0, sum_r / cnt, np.nan)
     # unbiased variance estimate; guard small n
@@ -711,13 +712,15 @@ def radial_profile_analysis(
     sem_t = np.where(cnt > 0, std_t / np.sqrt(cnt), np.nan)
     sem_r = np.where(cnt > 0, std_r / np.sqrt(cnt), np.nan)
     # Ratio on pixels where reference > 0: approximate using means (optionally) or recompute per-pixel
-    # Here we use mean of per-pixel ratio by sampling mask again per bin for better fidelity
-    mean_ratio = np.full(nbins, np.nan, dtype=float)
-    std_ratio = np.full(nbins, np.nan, dtype=float)
-    cnt_ratio = np.zeros(nbins, dtype=np.int64)
+    # Here we use mean of per-pixel ratio by sampling mask again per window for better fidelity
+    mean_ratio = np.full(nwindows, np.nan, dtype=float)
+    std_ratio = np.full(nwindows, np.nan, dtype=float)
+    cnt_ratio = np.zeros(nwindows, dtype=np.int64)
     eps_ratio = max(1e-12, float(ratio_ref_epsilon))
-    for k in range(nbins):
-        a = edges[k]; b = edges[k+1]
+    for k in range(nwindows):
+        a_pct, b_pct = windows[k]
+        a = a_pct / 100.0
+        b = b_pct / 100.0
         acc = []
         for lab in labels:
             cell = (masks == lab)
@@ -733,15 +736,9 @@ def radial_profile_analysis(
             if np.any(out_lab):
                 tout = np.zeros_like(tin, dtype=np.float32)
                 tout[out_lab] = 1.0 + (dist_bg[out_lab].astype(np.float32) / dmax)
-            if k == nbins - 1:
-                idx_in = cell & (tin >= a) & (tin <= b)
-            else:
-                idx_in = cell & (tin >= a) & (tin < b)
+            idx_in = cell & (tin >= a) & (tin <= b)
             if tout is not None:
-                if k == nbins - 1:
-                    idx_out = out_lab & (tout >= a) & (tout <= b)
-                else:
-                    idx_out = out_lab & (tout >= a) & (tout < b)
+                idx_out = out_lab & (tout >= a) & (tout <= b)
                 idx_band = idx_in | idx_out
             else:
                 idx_band = idx_in
@@ -759,9 +756,11 @@ def radial_profile_analysis(
                 cnt_ratio[k] = int(allv.size)
 
     # Table
+    band_starts = [a for a, b in windows]
+    band_ends = [b for a, b in windows]
     df = pd.DataFrame({
-        "band_start_pct": edges_pct[:-1],
-        "band_end_pct": edges_pct[1:],
+        "band_start_pct": band_starts,
+        "band_end_pct": band_ends,
         "center_pct": center_pct,
         "count_px": cnt,
         "mean_target": mean_t,
@@ -822,7 +821,8 @@ def radial_profile_single(
     ref_chan: int,
     start_pct: float,
     end_pct: float,
-    step_pct: float,
+    window_size_pct: float,
+    window_step_pct: float,
     pp_bg_enable: bool,
     pp_bg_radius: int,
     pp_norm_enable: bool,
@@ -873,30 +873,35 @@ def radial_profile_single(
         tout = np.zeros_like(tin, dtype=np.float32)
         tout[out_lab] = 1.0 + (dist_bg[out_lab].astype(np.float32) / dmax)
 
-    # Bins
-    s = float(start_pct); e = float(end_pct); st = float(step_pct)
-    if st <= 0: st = 5.0
+    # Sliding windows
+    s = float(start_pct); e = float(end_pct)
+    wsize = float(window_size_pct); wstep = float(window_step_pct)
+    if wsize <= 0: wsize = 10.0
+    if wstep <= 0: wstep = 5.0
     if e < s: s, e = e, s
-    edges_pct = np.arange(s, e + 1e-6, st, dtype=float)
-    if edges_pct[-1] < e:
-        edges_pct = np.append(edges_pct, e)
-    edges = edges_pct / 100.0
-    nbins = max(0, len(edges) - 1)
-    if nbins == 0:
-        raise ValueError("Invalid band settings: no bins formed")
+    
+    # Generate window starts from s to e-wsize (inclusive) with step wstep
+    window_starts = []
+    current = s
+    while current <= e - wsize + 1e-6:
+        window_starts.append(current)
+        current += wstep
+    
+    if len(window_starts) == 0:
+        raise ValueError(f"Invalid window settings: no windows formed (start={s}, end={e}, size={wsize}, step={wstep})")
+    
+    windows = [(start, start + wsize) for start in window_starts]
+    nwindows = len(windows)
 
     rows = []
-    for k in range(nbins):
-        a = edges[k]; b = edges[k+1]
-        if k == nbins - 1:
-            idx_in = cell & (tin >= a) & (tin <= b)
-        else:
-            idx_in = cell & (tin >= a) & (tin < b)
+    for k in range(nwindows):
+        a_pct, b_pct = windows[k]
+        a = a_pct / 100.0
+        b = b_pct / 100.0
+        # include both endpoints for the window
+        idx_in = cell & (tin >= a) & (tin <= b)
         if tout is not None:
-            if k == nbins - 1:
-                idx_out = out_lab & (tout >= a) & (tout <= b)
-            else:
-                idx_out = out_lab & (tout >= a) & (tout < b)
+            idx_out = out_lab & (tout >= a) & (tout <= b)
             idx_band = idx_in | idx_out
         else:
             idx_band = idx_in
@@ -904,9 +909,9 @@ def radial_profile_single(
         if n == 0:
             rows.append({
                 "label": lab,
-                "band_start_pct": edges_pct[k],
-                "band_end_pct": edges_pct[k+1],
-                "center_pct": (edges_pct[k] + edges_pct[k+1]) / 2.0,
+                "band_start_pct": a_pct,
+                "band_end_pct": b_pct,
+                "center_pct": (a_pct + b_pct) / 2.0,
                 "count_px": 0,
                 "mean_target": np.nan,
                 "mean_reference": np.nan,
@@ -938,9 +943,9 @@ def radial_profile_single(
         ratio_cnt = int(rr.size)
         rows.append({
             "label": lab,
-            "band_start_pct": edges_pct[k],
-            "band_end_pct": edges_pct[k+1],
-            "center_pct": (edges_pct[k] + edges_pct[k+1]) / 2.0,
+            "band_start_pct": a_pct,
+            "band_end_pct": b_pct,
+            "center_pct": (a_pct + b_pct) / 2.0,
             "count_px": n,
             "mean_target": mean_t,
             "mean_reference": mean_r,
@@ -1000,7 +1005,8 @@ def radial_profile_all_cells(
     ref_chan: int,
     start_pct: float,
     end_pct: float,
-    step_pct: float,
+    window_size_pct: float,
+    window_step_pct: float,
     pp_bg_enable: bool,
     pp_bg_radius: int,
     pp_norm_enable: bool,
@@ -1035,17 +1041,25 @@ def radial_profile_all_cells(
     dist_bg, idx = ndi.distance_transform_edt(~fg, return_indices=True)
     nearest_label = masks[idx[0], idx[1]]
 
-    # Bins
-    s = float(start_pct); e = float(end_pct); st = float(step_pct)
-    if st <= 0: st = 5.0
+    # Sliding windows
+    s = float(start_pct); e = float(end_pct)
+    wsize = float(window_size_pct); wstep = float(window_step_pct)
+    if wsize <= 0: wsize = 10.0
+    if wstep <= 0: wstep = 5.0
     if e < s: s, e = e, s
-    edges_pct = np.arange(s, e + 1e-6, st, dtype=float)
-    if edges_pct[-1] < e:
-        edges_pct = np.append(edges_pct, e)
-    edges = edges_pct / 100.0
-    nbins = max(0, len(edges) - 1)
-    if nbins == 0:
-        raise ValueError("Invalid band settings: no bins formed")
+    
+    # Generate window starts from s to e-wsize (inclusive) with step wstep
+    window_starts = []
+    current = s
+    while current <= e - wsize + 1e-6:
+        window_starts.append(current)
+        current += wstep
+    
+    if len(window_starts) == 0:
+        raise ValueError(f"Invalid window settings: no windows formed (start={s}, end={e}, size={wsize}, step={wstep})")
+    
+    windows = [(start, start + wsize) for start in window_starts]
+    nwindows = len(windows)
 
     rows = []
     for lab in labels:
@@ -1062,17 +1076,14 @@ def radial_profile_all_cells(
         if np.any(out_lab):
             tout = np.zeros_like(tin, dtype=np.float32)
             tout[out_lab] = 1.0 + (dist_bg[out_lab].astype(np.float32) / dmax)
-        for k in range(nbins):
-            a = edges[k]; b = edges[k+1]
-            if k == nbins - 1:
-                idx_in = cell & (tin >= a) & (tin <= b)
-            else:
-                idx_in = cell & (tin >= a) & (tin < b)
+        for k in range(nwindows):
+            a_pct, b_pct = windows[k]
+            a = a_pct / 100.0
+            b = b_pct / 100.0
+            # Include both endpoints for the window
+            idx_in = cell & (tin >= a) & (tin <= b)
             if tout is not None:
-                if k == nbins - 1:
-                    idx_out = out_lab & (tout >= a) & (tout <= b)
-                else:
-                    idx_out = out_lab & (tout >= a) & (tout < b)
+                idx_out = out_lab & (tout >= a) & (tout <= b)
                 idx_band = idx_in | idx_out
             else:
                 idx_band = idx_in
@@ -1080,9 +1091,9 @@ def radial_profile_all_cells(
             if n == 0:
                 rows.append({
                     "label": int(lab),
-                    "band_start_pct": edges_pct[k],
-                    "band_end_pct": edges_pct[k+1],
-                    "center_pct": (edges_pct[k] + edges_pct[k+1]) / 2.0,
+                    "band_start_pct": a_pct,
+                    "band_end_pct": b_pct,
+                    "center_pct": (a_pct + b_pct) / 2.0,
                     "count_px": 0,
                     "mean_target": np.nan,
                     "mean_reference": np.nan,
@@ -1114,9 +1125,9 @@ def radial_profile_all_cells(
             ratio_cnt = int(rr.size)
             rows.append({
                 "label": int(lab),
-                "band_start_pct": edges_pct[k],
-                "band_end_pct": edges_pct[k+1],
-                "center_pct": (edges_pct[k] + edges_pct[k+1]) / 2.0,
+                "band_start_pct": a_pct,
+                "band_end_pct": b_pct,
+                "center_pct": (a_pct + b_pct) / 2.0,
                 "count_px": n,
                 "mean_target": mean_t,
                 "mean_reference": mean_r,
@@ -1875,8 +1886,9 @@ def build_ui():
                         with gr.Accordion("Radial intensity profile", open=True):
                             prof_start = gr.Number(value=0.0, label="Start %", scale=1)
                             prof_end = gr.Number(value=150.0, label="End %", scale=1)
-                            prof_step = gr.Number(value=5.0, label="Step %", scale=1)
-                            prof_window = gr.Number(value=1, label="Smoothing window (bins)", scale=1)
+                            prof_window_size = gr.Number(value=5.0, label="Window size (%)", scale=1)
+                            prof_window_step = gr.Number(value=2.0, label="Window moving step (%)", scale=1)
+                            prof_smoothing = gr.Number(value=1, label="Plot smoothing (moving avg bins)", scale=1)
                             
                         # Cache states for radial profile results (computed by 6.)
                         prof_cache_df_state = gr.State()
@@ -1946,7 +1958,7 @@ def build_ui():
                     outputs=[rad_overlay, radial_mask_state, radial_label_state, rad_tiff, rad_lbl_tiff, radial_table, radial_csv, radial_tar_overlay, radial_ref_overlay, radial_tgt_on_and_img, radial_ref_on_and_img, radial_ratio_img, radial_quant_df_state],
                 )
                 # Radial profile callback
-                def _radial_profile_cb(tgt_img, ref_img, masks, tchan, rchan, s, e, st, win, show_err, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m, man_t, man_r, eps):
+                def _radial_profile_cb(tgt_img, ref_img, masks, tchan, rchan, s, e, wsize, wstep, smoothing, show_err, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m, man_t, man_r, eps):
                     # manual backgrounds only if explicitly manual mode
                     bgm = str(bg_mode)
                     mt = float(man_t) if (bg_en and bgm == "manual") else None
@@ -1954,7 +1966,7 @@ def build_ui():
                     # All-cells table + CSV
                     df_all, csv_all = radial_profile_all_cells(
                         tgt_img, ref_img, masks, tchan, rchan,
-                        float(s), float(e), float(st),
+                        float(s), float(e), float(wsize), float(wstep),
                         bool(bg_en), int(bg_r), bool(nm_en), nm_m,
                         bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
                         manual_tar_bg=mt, manual_ref_bg=mr, ratio_ref_epsilon=float(eps),
@@ -1962,11 +1974,11 @@ def build_ui():
                     # Mean plot
                     _, _, plot_img = radial_profile_analysis(
                         tgt_img, ref_img, masks, tchan, rchan,
-                        float(s), float(e), float(st),
+                        float(s), float(e), float(wsize), float(wstep),
                         bool(bg_en), int(bg_r), bool(nm_en), nm_m,
                         bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
                         manual_tar_bg=mt, manual_ref_bg=mr,
-                        window_bins=int(win), show_errorbars=bool(show_err), ratio_ref_epsilon=float(eps),
+                        window_bins=int(smoothing), show_errorbars=bool(show_err), ratio_ref_epsilon=float(eps),
                     )
                     # Build cache params signature
                     try:
@@ -1978,7 +1990,8 @@ def build_ui():
                     except Exception:
                         lab_count = 0; lab_max = 0; mshape = None
                     params = dict(
-                        tchan=str(tchan), rchan=str(rchan), start=float(s), end=float(e), step=float(st),
+                        tchan=str(tchan), rchan=str(rchan), start=float(s), end=float(e), 
+                        window_size=float(wsize), window_step=float(wstep),
                         bg_enable=bool(bg_en), bg_mode=str(bg_mode), bg_radius=int(bg_r), dark_pct=float(dark_pct),
                         norm_enable=bool(nm_en), norm_method=str(nm_m),
                         man_t=float(mt) if mt is not None else None, man_r=float(mr) if mr is not None else None,
@@ -1988,10 +2001,10 @@ def build_ui():
                     return df_all, csv_all, plot_img, df_all, csv_all, plot_img, params
                 run_prof_btn.click(
                     fn=_radial_profile_cb,
-                    inputs=[tgt, ref, masks_state, tgt_chan, ref_chan, prof_start, prof_end, prof_step, prof_window, prof_show_err, pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method, bak_tar, bak_ref, ratio_eps],
+                    inputs=[tgt, ref, masks_state, tgt_chan, ref_chan, prof_start, prof_end, prof_window_size, prof_window_step, prof_smoothing, prof_show_err, pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method, bak_tar, bak_ref, ratio_eps],
                     outputs=[profile_table, profile_csv, profile_plot, prof_cache_df_state, prof_cache_csv_state, prof_cache_plot_state, prof_cache_params_state],
                 )
-                def _radial_profile_single_or_all_cb(tgt_img, ref_img, masks, label_val, tchan, rchan, s, e, st, win, show_err, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m, man_t, man_r, eps, cache_df, cache_csv, cache_plot, cache_params, peak_df):
+                def _radial_profile_single_or_all_cb(tgt_img, ref_img, masks, label_val, tchan, rchan, s, e, wsize, wstep, smoothing, show_err, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m, man_t, man_r, eps, cache_df, cache_csv, cache_plot, cache_params, peak_df):
                     bgm = str(bg_mode)
                     mt = float(man_t) if (bg_en and bgm == "manual") else None
                     mr = float(man_r) if (bg_en and bgm == "manual") else None
@@ -2005,7 +2018,8 @@ def build_ui():
                     except Exception:
                         lab_count = 0; lab_max = 0; mshape = None
                     cur_params = dict(
-                        tchan=str(tchan), rchan=str(rchan), start=float(s), end=float(e), step=float(st),
+                        tchan=str(tchan), rchan=str(rchan), start=float(s), end=float(e), 
+                        window_size=float(wsize), window_step=float(wstep),
                         bg_enable=bool(bg_en), bg_mode=str(bg_mode), bg_radius=int(bg_r), dark_pct=float(dark_pct),
                         norm_enable=bool(nm_en), norm_method=str(nm_m),
                         man_t=float(mt) if mt is not None else None, man_r=float(mr) if mr is not None else None,
@@ -2024,17 +2038,17 @@ def build_ui():
 
                         # If cache matches, rebuild plot from cached DF (no recompute)
                         if (cache_df is not None) and params_equal(cache_params, cur_params):
-                            plot_img = _build_all_plot_from_df(cache_df, int(win), bool(show_err), peak_df)
+                            plot_img = _build_all_plot_from_df(cache_df, int(smoothing), bool(show_err), peak_df)
                             return cache_df, cache_csv, plot_img, cache_df, cache_csv, plot_img, cache_params
                         # Else recompute all-cells DF, then plot from DF only
                         df_all, csv_all = radial_profile_all_cells(
                             tgt_img, ref_img, masks, tchan, rchan,
-                            float(s), float(e), float(st),
+                            float(s), float(e), float(wsize), float(wstep),
                             bool(bg_en), int(bg_r), bool(nm_en), nm_m,
                             bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
                             manual_tar_bg=mt, manual_ref_bg=mr, ratio_ref_epsilon=float(eps),
                         )
-                        plot_img = _build_all_plot_from_df(df_all, int(win), bool(show_err), peak_df)
+                        plot_img = _build_all_plot_from_df(df_all, int(smoothing), bool(show_err), peak_df)
                         return df_all, csv_all, plot_img, df_all, csv_all, plot_img, cur_params
                     else:
                         try:
@@ -2051,7 +2065,7 @@ def build_ui():
                             # Recompute all-cells to fill cache (so subsequent switches are instant)
                             use_df, csv_all = radial_profile_all_cells(
                                 tgt_img, ref_img, masks, tchan, rchan,
-                                float(s), float(e), float(st),
+                                float(s), float(e), float(wsize), float(wstep),
                                 bool(bg_en), int(bg_r), bool(nm_en), nm_m,
                                 bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
                                 manual_tar_bg=mt, manual_ref_bg=mr,
@@ -2059,11 +2073,11 @@ def build_ui():
                             # Also compute All mean plot for completeness of cache
                             _, _, cache_plot_new = radial_profile_analysis(
                                 tgt_img, ref_img, masks, tchan, rchan,
-                                float(s), float(e), float(st),
+                                float(s), float(e), float(wsize), float(wstep),
                                 bool(bg_en), int(bg_r), bool(nm_en), nm_m,
                                 bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
                                 manual_tar_bg=mt, manual_ref_bg=mr,
-                                window_bins=int(win), show_errorbars=bool(show_err), ratio_ref_epsilon=float(eps),
+                                window_bins=int(smoothing), show_errorbars=bool(show_err), ratio_ref_epsilon=float(eps),
                             )
                             cache_df = use_df; cache_csv = csv_all; cache_plot = cache_plot_new; cache_params = cur_params
                         # Slice single label rows
@@ -2073,27 +2087,27 @@ def build_ui():
                             # Fallback to direct compute for the label
                             df1, csv1, plot1 = radial_profile_single(
                                 tgt_img, ref_img, masks, lab, tchan, rchan,
-                                float(s), float(e), float(st),
+                                float(s), float(e), float(wsize), float(wstep),
                                 bool(bg_en), int(bg_r), bool(nm_en), nm_m,
                                 bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
                                 manual_tar_bg=mt, manual_ref_bg=mr,
-                                window_bins=int(win), show_errorbars=bool(show_err), ratio_ref_epsilon=float(eps),
+                                window_bins=int(smoothing), show_errorbars=bool(show_err), ratio_ref_epsilon=float(eps),
                             )
                             return df1, csv1, plot1, cache_df, cache_csv, cache_plot, cache_params
                         # Write CSV for this label
                         tmp_csv = tempfile.NamedTemporaryFile(delete=False, suffix=f"_radial_profile_label_{lab}.csv")
                         df1.to_csv(tmp_csv.name, index=False)
                         # Plot for this label using the new helper function
-                        plot1 = plot_radial_profile_with_peaks(use_df, peak_df, lab, int(win), bool(show_err))
+                        plot1 = plot_radial_profile_with_peaks(use_df, peak_df, lab, int(smoothing), bool(show_err))
                         return df1, tmp_csv.name, plot1, cache_df, cache_csv, cache_plot, cache_params
                 run_prof_single_btn.click(
                     fn=_radial_profile_single_or_all_cb,
-                    inputs=[tgt, ref, masks_state, prof_label, tgt_chan, ref_chan, prof_start, prof_end, prof_step, prof_window, prof_show_err, pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method, bak_tar, bak_ref, ratio_eps, prof_cache_df_state, prof_cache_csv_state, prof_cache_plot_state, prof_cache_params_state, peak_diff_state],
+                    inputs=[tgt, ref, masks_state, prof_label, tgt_chan, ref_chan, prof_start, prof_end, prof_window_size, prof_window_step, prof_smoothing, prof_show_err, pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method, bak_tar, bak_ref, ratio_eps, prof_cache_df_state, prof_cache_csv_state, prof_cache_plot_state, prof_cache_params_state, peak_diff_state],
                     outputs=[profile_table, profile_csv, profile_plot, prof_cache_df_state, prof_cache_csv_state, prof_cache_plot_state, prof_cache_params_state],
                 )
                 
                 # Peak difference callback
-                def _peak_diff_cb(cached_df, quant_df, min_pct, max_pct, label_val, win, show_err):
+                def _peak_diff_cb(cached_df, quant_df, min_pct, max_pct, label_val, smoothing, show_err):
                     if cached_df is None or cached_df.empty:
                         return gr.update(value=pd.DataFrame()), None, gr.update(), None
                     
@@ -2111,7 +2125,7 @@ def build_ui():
                     # Regenerate plot with peak markers
                     try:
                         plot_img = plot_radial_profile_with_peaks(
-                            cached_df, peak_df, label_val, int(win), bool(show_err), title_suffix="(with peaks)"
+                            cached_df, peak_df, label_val, int(smoothing), bool(show_err), title_suffix="(with peaks)"
                         )
                     except Exception:
                         plot_img = None
@@ -2120,7 +2134,7 @@ def build_ui():
                 
                 run_peak_diff_btn.click(
                     fn=_peak_diff_cb,
-                    inputs=[prof_cache_df_state, quant_df_state, peak_min_pct, peak_max_pct, prof_label, prof_window, prof_show_err],
+                    inputs=[prof_cache_df_state, quant_df_state, peak_min_pct, peak_max_pct, prof_label, prof_smoothing, prof_show_err],
                     outputs=[peak_diff_table, peak_diff_csv, profile_plot, peak_diff_state],
                 )
                 
@@ -2210,7 +2224,7 @@ def build_ui():
                         tgt_chan, tgt_mask_mode, tgt_sat_limit, tgt_pct, tgt_min_obj,
                         ref_chan, ref_mask_mode, ref_sat_limit, ref_pct, ref_min_obj,
                         px_w, px_h,
-                        prof_start, prof_end, prof_step, prof_window, prof_show_err,
+                        prof_start, prof_end, prof_window_size, prof_window_step, prof_smoothing, prof_show_err,
                         ratio_eps,
                         label_scale,
                     ],
@@ -2225,7 +2239,7 @@ def build_ui():
                                 tgt_chan: 'gray', tgt_mask_mode: 'global_percentile', tgt_sat_limit: 254, tgt_pct: 75.0, tgt_min_obj: 50,
                                 ref_chan: 'gray', ref_mask_mode: 'global_percentile', ref_sat_limit: 254, ref_pct: 75.0, ref_min_obj: 50,
                                 px_w: 1.0, px_h: 1.0,
-                                prof_start: 0.0, prof_end: 150.0, prof_step: 5.0, prof_window: 1, prof_show_err: true,
+                                prof_start: 0.0, prof_end: 150.0, prof_window_size: 10.0, prof_window_step: 5.0, prof_smoothing: 1, prof_show_err: true,
                                 ratio_eps: 1e-6,
                                 label_scale: {float(LABEL_SCALE)},
                             }};
@@ -2264,8 +2278,9 @@ def build_ui():
                                 s.px_h,
                                 s.prof_start,
                                 s.prof_end,
-                                s.prof_step,
-                                s.prof_window,
+                                s.prof_window_size,
+                                s.prof_window_step,
+                                s.prof_smoothing,
                                 s.prof_show_err,
                                 s.ratio_eps,
                                 s.label_scale,
@@ -2279,8 +2294,8 @@ def build_ui():
                                 'gray', 'global_percentile', 254, 75.0, 50,
                                 'gray', 'global_percentile', 254, 75.0, 50,
                                 1.0, 1.0,
-                                0.0, 150.0, 5.0, 1, true,
-                                0.0,
+                                0.0, 150.0, 10.0, 5.0, 1, true,
+                                1e-6,
                                 {float(LABEL_SCALE)},
                             ];
                         }}
@@ -2315,7 +2330,7 @@ def build_ui():
                     (tgt_chan, 'tgt_chan'), (tgt_mask_mode, 'tgt_mask_mode'), (tgt_sat_limit, 'tgt_sat_limit'), (tgt_pct, 'tgt_pct'), (tgt_min_obj, 'tgt_min_obj'),
                     (ref_chan, 'ref_chan'), (ref_mask_mode, 'ref_mask_mode'), (ref_sat_limit, 'ref_sat_limit'), (ref_pct, 'ref_pct'), (ref_min_obj, 'ref_min_obj'),
                     (px_w, 'px_w'), (px_h, 'px_h'), (label_scale, 'label_scale'),
-                    (prof_start, 'prof_start'), (prof_end, 'prof_end'), (prof_step, 'prof_step'), (prof_window, 'prof_window'), (prof_show_err, 'prof_show_err'),
+                    (prof_start, 'prof_start'), (prof_end, 'prof_end'), (prof_window_size, 'prof_window_size'), (prof_window_step, 'prof_window_step'), (prof_smoothing, 'prof_smoothing'), (prof_show_err, 'prof_show_err'),
                 ]:
                     _persist_change(comp, key)
 
@@ -2338,7 +2353,7 @@ def build_ui():
                         tgt_chan, tgt_mask_mode, tgt_sat_limit, tgt_pct, tgt_min_obj,
                         ref_chan, ref_mask_mode, ref_sat_limit, ref_pct, ref_min_obj,
                         px_w, px_h,
-                        prof_start, prof_end, prof_step, prof_window, prof_show_err,
+                        prof_start, prof_end, prof_window_size, prof_window_step, prof_smoothing, prof_show_err,
                         label_scale,
                     ],
                     js=f"""
@@ -2356,7 +2371,7 @@ def build_ui():
                             'gray', 'none', 254, 75.0, 50,
                             'gray', 'none', 254, 75.0, 50,
                             1.0, 1.0,
-                            0.0, 150.0, 5.0, 1, true,
+                            0.0, 150.0, 10.0, 5.0, 1, true,
                             {float(LABEL_SCALE)},
                         ];
                     }}
