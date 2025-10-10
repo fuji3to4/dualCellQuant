@@ -1,9 +1,11 @@
 """
 Gradio UI for DualCellQuant.
 
-Two modes:
-1. Step-by-step Analysis: Individual control over each step (1-4)
-2. Quick Radial Profile: One-click pipeline for radial analysis (1,2,3,5,6)
+Two tabs:
+1. 📋 Step-by-Step: Individual control over steps 1-4
+2. ⚡ Radial Profile: One-click pipeline for steps 1→2→3→5→6
+
+Settings are shared via localStorage.
 """
 
 import gradio as gr
@@ -12,6 +14,8 @@ import pandas as pd
 import numpy as np
 
 from dualcellquant import *
+from dualcellquant.ui_callbacks_stepbystep import create_stepbystep_callbacks
+from dualcellquant.ui_callbacks_radialprofile import create_radialprofile_callbacks
 
 def build_ui():
     with gr.Blocks(title="DualCellQuant") as demo:
@@ -19,14 +23,31 @@ def build_ui():
             """
             # 🔬 **DualCellQuant**
             *Segment, filter, and compare cells across two fluorescence channels*
-            1. **Run Cellpose-SAM** to obtain segmentation masks.
-            2. **Build Radial mask** (optional).
-            3. **Apply Target/Reference masks**.
-            4. **Integrate** (Preprocess applied only here) and view results.
+            
+            **📋 Step-by-Step**: Detailed control (Steps 1→2→3→4)  
+            **⚡ Radial Profile**: One-click analysis (Steps 1→2→3→5→6)
+            
+            *Settings are automatically shared between tabs*
             """
         )
-        with gr.Tabs():
-            with gr.TabItem("Dual images"):
+        
+        # Shared state variables
+        masks_state = gr.State()
+        radial_mask_state = gr.State()
+        radial_label_state = gr.State()
+        tgt_mask_state = gr.State()
+        ref_mask_state = gr.State()
+        quant_df_state = gr.State()
+        radial_quant_df_state = gr.State()
+        prof_cache_df_state = gr.State()
+        prof_cache_csv_state = gr.State()
+        prof_cache_plot_state = gr.State()
+        prof_cache_params_state = gr.State()
+        peak_diff_state = gr.State()
+        
+        with gr.Tabs() as tabs:
+            # ==================== Tab 1: Step-by-Step (Steps 1-4) ====================
+            with gr.TabItem("📋 Step-by-Step", id=0) as tab_stepbystep:
                 masks_state = gr.State()
                 radial_mask_state = gr.State()
                 radial_label_state = gr.State()
@@ -192,296 +213,48 @@ def build_ui():
                         peak_diff_table = gr.Dataframe(label="Peak difference per label", interactive=False, pinned_columns=1)
                         peak_diff_csv = gr.File(label="Download peak difference CSV")
 
-                # Segmentation
-                def _run_seg(tgt_img, ref_img, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu):
-                    ov, seg_tif, mask_viz, masks = run_segmentation(tgt_img, ref_img, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu)
-                    # Build dropdown choices for labels
-                    try:
-                        labs = np.unique(masks)
-                        labs = labs[labs > 0]
-                        choices = ["All"] + [str(int(l)) for l in labs]
-                    except Exception:
-                        choices = ["All"]
-                    # Reset radial-profile caches upon new segmentation
-                    return ov, seg_tif, mask_viz, masks, gr.update(choices=choices, value="All"), None, None, None, None
-                run_seg_btn.click(
-                    fn=_run_seg,
-                    inputs=[tgt, ref, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu],
-                    outputs=[seg_overlay, seg_tiff_file, mask_img, masks_state, prof_label, prof_cache_df_state, prof_cache_csv_state, prof_cache_plot_state, prof_cache_params_state],
-                )
-                # Radial mask (now at bottom)
-                def _radial_and_quantify(tgt_img, ref_img, masks, rin, rout, mino, tmask, rmask, tchan, rchan, pw, ph, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m, man_t, man_r, eps):
-                    ov, rad_bool, rad_lbl, tiff_bool, tiff_lbl = radial_mask(masks, rin, rout, mino)
-                    # choose manual backgrounds only when mode is manual
-                    bgm = str(bg_mode)
-                    mt = float(man_t) if (bg_en and bgm == "manual") else None
-                    mr = float(man_r) if (bg_en and bgm == "manual") else None
-                    q_tar_ov, q_ref_ov, q_and_tiff, q_df, q_csv, q_tgt_on, q_ref_on, q_ratio = integrate_and_quantify(
-                        tgt_img, ref_img, masks, tmask, rmask, tchan, rchan, pw, ph,
-                        bool(bg_en), int(bg_r), bool(nm_en), nm_m,
-                        bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
-                        manual_tar_bg=mt, manual_ref_bg=mr, roi_mask=rad_bool, roi_labels=rad_lbl, ratio_ref_epsilon=float(eps),
-                    )
-                    return ov, rad_bool, rad_lbl, tiff_bool, tiff_lbl, q_df, q_csv, q_tar_ov, q_ref_ov, q_tgt_on, q_ref_on, q_ratio, q_df
-                run_rad_btn.click(
-                    fn=_radial_and_quantify,
-                    inputs=[tgt, ref, masks_state, rad_in, rad_out, rad_min_obj, tgt_mask_state, ref_mask_state, tgt_chan, ref_chan, px_w, px_h, pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method, bak_tar, bak_ref, ratio_eps],
-                    outputs=[rad_overlay, radial_mask_state, radial_label_state, rad_tiff, rad_lbl_tiff, radial_table, radial_csv, radial_tar_overlay, radial_ref_overlay, radial_tgt_on_and_img, radial_ref_on_and_img, radial_ratio_img, radial_quant_df_state],
-                )
-                # Radial profile callback
-                def _radial_profile_cb(tgt_img, ref_img, masks, tchan, rchan, s, e, wsize, wstep, smoothing, show_err, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m, man_t, man_r, eps):
-                    # manual backgrounds only if explicitly manual mode
-                    bgm = str(bg_mode)
-                    mt = float(man_t) if (bg_en and bgm == "manual") else None
-                    mr = float(man_r) if (bg_en and bgm == "manual") else None
-                    # All-cells table + CSV
-                    df_all, csv_all = radial_profile_all_cells(
-                        tgt_img, ref_img, masks, tchan, rchan,
-                        float(s), float(e), float(wsize), float(wstep),
-                        bool(bg_en), int(bg_r), bool(nm_en), nm_m,
-                        bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
-                        manual_tar_bg=mt, manual_ref_bg=mr, ratio_ref_epsilon=float(eps),
-                    )
-                    # Mean plot
-                    _, _, plot_img = radial_profile_analysis(
-                        tgt_img, ref_img, masks, tchan, rchan,
-                        float(s), float(e), float(wsize), float(wstep),
-                        bool(bg_en), int(bg_r), bool(nm_en), nm_m,
-                        bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
-                        manual_tar_bg=mt, manual_ref_bg=mr,
-                        window_bins=int(smoothing), show_errorbars=bool(show_err), ratio_ref_epsilon=float(eps),
-                    )
-                    # Build cache params signature
-                    try:
-                        labs = np.unique(masks)
-                        labs = labs[labs > 0]
-                        lab_count = int(labs.size)
-                        lab_max = int(labs.max()) if lab_count > 0 else 0
-                        mshape = tuple(masks.shape)
-                    except Exception:
-                        lab_count = 0; lab_max = 0; mshape = None
-                    params = dict(
-                        tchan=str(tchan), rchan=str(rchan), start=float(s), end=float(e), 
-                        window_size=float(wsize), window_step=float(wstep),
-                        bg_enable=bool(bg_en), bg_mode=str(bg_mode), bg_radius=int(bg_r), dark_pct=float(dark_pct),
-                        norm_enable=bool(nm_en), norm_method=str(nm_m),
-                        man_t=float(mt) if mt is not None else None, man_r=float(mr) if mr is not None else None,
-                        ratio_eps=float(eps),
-                        mask_shape=mshape, lab_count=lab_count, lab_max=lab_max,
-                    )
-                    return df_all, csv_all, plot_img, df_all, csv_all, plot_img, params
-                run_prof_btn.click(
-                    fn=_radial_profile_cb,
-                    inputs=[tgt, ref, masks_state, tgt_chan, ref_chan, prof_start, prof_end, prof_window_size, prof_window_step, prof_smoothing, prof_show_err, pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method, bak_tar, bak_ref, ratio_eps],
-                    outputs=[profile_table, profile_csv, profile_plot, prof_cache_df_state, prof_cache_csv_state, prof_cache_plot_state, prof_cache_params_state],
-                )
-                def _radial_profile_single_or_all_cb(tgt_img, ref_img, masks, label_val, tchan, rchan, s, e, wsize, wstep, smoothing, show_err, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m, man_t, man_r, eps, cache_df, cache_csv, cache_plot, cache_params, peak_df):
-                    bgm = str(bg_mode)
-                    mt = float(man_t) if (bg_en and bgm == "manual") else None
-                    mr = float(man_r) if (bg_en and bgm == "manual") else None
-                    # Build current params signature for cache matching
-                    try:
-                        labs_now = np.unique(masks)
-                        labs_now = labs_now[labs_now > 0]
-                        lab_count = int(labs_now.size)
-                        lab_max = int(labs_now.max()) if lab_count > 0 else 0
-                        mshape = tuple(masks.shape)
-                    except Exception:
-                        lab_count = 0; lab_max = 0; mshape = None
-                    cur_params = dict(
-                        tchan=str(tchan), rchan=str(rchan), start=float(s), end=float(e), 
-                        window_size=float(wsize), window_step=float(wstep),
-                        bg_enable=bool(bg_en), bg_mode=str(bg_mode), bg_radius=int(bg_r), dark_pct=float(dark_pct),
-                        norm_enable=bool(nm_en), norm_method=str(nm_m),
-                        man_t=float(mt) if mt is not None else None, man_r=float(mr) if mr is not None else None,
-                        ratio_eps=float(eps),
-                        mask_shape=mshape, lab_count=lab_count, lab_max=lab_max,
-                    )
-                    def params_equal(a, b):
-                        try:
-                            return a == b
-                        except Exception:
-                            return False
-                    if str(label_val) == "All":
-                        # Helper to rebuild All-cells mean plot from cached all-cells DF (no recompute)
-                        def _build_all_plot_from_df(df_all_in: pd.DataFrame, window_bins_int: int, show_err_bool: bool, peak_df_in: pd.DataFrame = None):
-                            return plot_radial_profile_with_peaks(df_all_in, peak_df_in, "All", window_bins_int, show_err_bool)
-
-                        # If cache matches, rebuild plot from cached DF (no recompute)
-                        if (cache_df is not None) and params_equal(cache_params, cur_params):
-                            plot_img = _build_all_plot_from_df(cache_df, int(smoothing), bool(show_err), peak_df)
-                            return cache_df, cache_csv, plot_img, cache_df, cache_csv, plot_img, cache_params
-                        # Else recompute all-cells DF, then plot from DF only
-                        df_all, csv_all = radial_profile_all_cells(
-                            tgt_img, ref_img, masks, tchan, rchan,
-                            float(s), float(e), float(wsize), float(wstep),
-                            bool(bg_en), int(bg_r), bool(nm_en), nm_m,
-                            bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
-                            manual_tar_bg=mt, manual_ref_bg=mr, ratio_ref_epsilon=float(eps),
-                        )
-                        plot_img = _build_all_plot_from_df(df_all, int(smoothing), bool(show_err), peak_df)
-                        return df_all, csv_all, plot_img, df_all, csv_all, plot_img, cur_params
-                    else:
-                        try:
-                            lab = int(str(label_val))
-                        except Exception:
-                            lab = None
-                        if lab is None:
-                            return gr.update(), None, None, cache_df, cache_csv, cache_plot, cache_params
-                        # Prefer cached all-cells DF for slicing if available and params match
-                        use_df = None
-                        if (cache_df is not None) and params_equal(cache_params, cur_params):
-                            use_df = cache_df
-                        else:
-                            # Recompute all-cells to fill cache (so subsequent switches are instant)
-                            use_df, csv_all = radial_profile_all_cells(
-                                tgt_img, ref_img, masks, tchan, rchan,
-                                float(s), float(e), float(wsize), float(wstep),
-                                bool(bg_en), int(bg_r), bool(nm_en), nm_m,
-                                bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
-                                manual_tar_bg=mt, manual_ref_bg=mr,
-                            )
-                            # Also compute All mean plot for completeness of cache
-                            _, _, cache_plot_new = radial_profile_analysis(
-                                tgt_img, ref_img, masks, tchan, rchan,
-                                float(s), float(e), float(wsize), float(wstep),
-                                bool(bg_en), int(bg_r), bool(nm_en), nm_m,
-                                bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
-                                manual_tar_bg=mt, manual_ref_bg=mr,
-                                window_bins=int(smoothing), show_errorbars=bool(show_err), ratio_ref_epsilon=float(eps),
-                            )
-                            cache_df = use_df; cache_csv = csv_all; cache_plot = cache_plot_new; cache_params = cur_params
-                        # Slice single label rows
-                        try:
-                            df1 = use_df[use_df["label"] == int(lab)].copy()
-                        except Exception:
-                            # Fallback to direct compute for the label
-                            df1, csv1, plot1 = radial_profile_single(
-                                tgt_img, ref_img, masks, lab, tchan, rchan,
-                                float(s), float(e), float(wsize), float(wstep),
-                                bool(bg_en), int(bg_r), bool(nm_en), nm_m,
-                                bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
-                                manual_tar_bg=mt, manual_ref_bg=mr,
-                                window_bins=int(smoothing), show_errorbars=bool(show_err), ratio_ref_epsilon=float(eps),
-                            )
-                            return df1, csv1, plot1, cache_df, cache_csv, cache_plot, cache_params
-                        # Write CSV for this label
-                        tmp_csv = tempfile.NamedTemporaryFile(delete=False, suffix=f"_radial_profile_label_{lab}.csv")
-                        df1.to_csv(tmp_csv.name, index=False)
-                        # Plot for this label using the new helper function
-                        plot1 = plot_radial_profile_with_peaks(use_df, peak_df, lab, int(smoothing), bool(show_err))
-                        return df1, tmp_csv.name, plot1, cache_df, cache_csv, cache_plot, cache_params
-                run_prof_single_btn.click(
-                    fn=_radial_profile_single_or_all_cb,
-                    inputs=[tgt, ref, masks_state, prof_label, tgt_chan, ref_chan, prof_start, prof_end, prof_window_size, prof_window_step, prof_smoothing, prof_show_err, pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method, bak_tar, bak_ref, ratio_eps, prof_cache_df_state, prof_cache_csv_state, prof_cache_plot_state, prof_cache_params_state, peak_diff_state],
-                    outputs=[profile_table, profile_csv, profile_plot, prof_cache_df_state, prof_cache_csv_state, prof_cache_plot_state, prof_cache_params_state],
-                )
-                
-                # Peak difference callback
-                def _peak_diff_cb(cached_df, quant_df, min_pct, max_pct, label_val, smoothing, show_err):
-                    if cached_df is None or cached_df.empty:
-                        return gr.update(value=pd.DataFrame()), None, gr.update(), None
-                    
-                    peak_df = compute_radial_peak_difference(cached_df, quant_df, float(min_pct), float(max_pct))
-                    
-                    if peak_df.empty:
-                        return gr.update(value=pd.DataFrame()), None, gr.update(), None
-                    
-                    # Save to CSV
-                    tmp_csv = tempfile.NamedTemporaryFile(delete=False, suffix="_peak_difference.csv")
-                    peak_df.to_csv(tmp_csv.name, index=False)
-                    tmp_csv_path = tmp_csv.name  # Extract the path string
-                    tmp_csv.close()  # Close the file wrapper
-                    
-                    # Regenerate plot with peak markers
-                    try:
-                        plot_img = plot_radial_profile_with_peaks(
-                            cached_df, peak_df, label_val, int(smoothing), bool(show_err), title_suffix="(with peaks)"
-                        )
-                    except Exception:
-                        plot_img = None
-                    
-                    return peak_df, tmp_csv_path, plot_img, peak_df
-                
-                run_peak_diff_btn.click(
-                    fn=_peak_diff_cb,
-                    inputs=[prof_cache_df_state, quant_df_state, peak_min_pct, peak_max_pct, prof_label, prof_smoothing, prof_show_err],
-                    outputs=[peak_diff_table, peak_diff_csv, profile_plot, peak_diff_state],
-                )
-                
-                # Target/Reference masking (no ROI coupling)
-                def _apply_mask_generic(img, m, ch, sat, mode, p, mino, name):
-                    return apply_mask(img, m, ch, sat, mode, p, mino, None, name)
-                # Combined: apply both masks in one click from the Target button
-                def _apply_masks_both(tgt_img, ref_img, m, t_ch, t_sat, t_mode, t_p, t_mino, r_ch, r_sat, r_mode, r_p, r_mino):
-                    t_ov, t_tiff_path, t_mask = apply_mask(tgt_img, m, t_ch, t_sat, t_mode, t_p, t_mino, None, "target_mask")
-                    r_ov, r_tiff_path, r_mask = apply_mask(ref_img, m, r_ch, r_sat, r_mode, r_p, r_mino, None, "reference_mask")
-                    return t_ov, t_tiff_path, t_mask, r_ov, r_tiff_path, r_mask
-                run_tgt_btn.click(
-                    fn=_apply_masks_both,
-                    inputs=[tgt, ref, masks_state, tgt_chan, tgt_sat_limit, tgt_mask_mode, tgt_pct, tgt_min_obj, ref_chan, ref_sat_limit, ref_mask_mode, ref_pct, ref_min_obj],
-                    outputs=[tgt_overlay, tgt_tiff, tgt_mask_state, ref_overlay, ref_tiff, ref_mask_state],
-                )
-
-                # Toggle percentile slider visibility based on mask mode
-                def _toggle_pct_vis(mode: str):
-                    m = (str(mode) if mode is not None else '').lower()
-                    return gr.update(visible=(m in ("global_percentile", "per_cell_percentile")))
-                tgt_mask_mode.change(
-                    fn=_toggle_pct_vis,
-                    inputs=[tgt_mask_mode],
-                    outputs=[tgt_pct],
-                )
-                ref_mask_mode.change(
-                    fn=_toggle_pct_vis,
-                    inputs=[ref_mask_mode],
-                    outputs=[ref_pct],
-                )
-
-                def _pp_bg_mode_changed_int(mode: str):
-                    m = (mode or "rolling").lower()
-                    return (
-                        gr.update(visible=(m == "rolling")),
-                        gr.update(visible=(m == "dark_subtract")),
-                        gr.update(visible=(m in ("manual", "dark_subtract"))),
-                        gr.update(visible=(m in ("manual", "dark_subtract"))),
-                    )
-                pp_bg_mode.change(
-                    fn=_pp_bg_mode_changed_int,
-                    inputs=[pp_bg_mode],
-                    outputs=[pp_bg_radius, pp_dark_pct, bak_tar, bak_ref],
-                )
-                def _integrate_callback(tgt_img, ref_img, ms, tmask, rmask, tchan, rchan, pw, ph, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m, man_t, man_r, eps):
-                    # Decide manual backgrounds and display values
-                    bg_mode_s = str(bg_mode)
-                    out_tar_bg = man_t
-                    out_ref_bg = man_r
-                    if str(bg_en).lower() in ("true", "1") and bg_mode_s == "dark_subtract":
-                        try:
-                            out_tar_bg = compute_dark_background(tgt_img, tchan, float(dark_pct), use_native_scale=True)
-                        except Exception:
-                            out_tar_bg = man_t
-                        try:
-                            out_ref_bg = compute_dark_background(ref_img, rchan, float(dark_pct), use_native_scale=True)
-                        except Exception:
-                            out_ref_bg = man_r
-                    # Prepare manual values to pass (only used if mode is manual)
-                    man_t = float(out_tar_bg) if (bg_en and bg_mode_s == "manual") else None
-                    man_r = float(out_ref_bg) if (bg_en and bg_mode_s == "manual") else None
-                    res = integrate_and_quantify(
-                        tgt_img, ref_img, ms, tmask, rmask, tchan, rchan,
-                        pw, ph,
-                        bool(bg_en), int(bg_r), bool(nm_en), nm_m,
-                        bg_mode=str(bg_mode), bg_dark_pct=float(dark_pct),
-                        manual_tar_bg=man_t, manual_ref_bg=man_r, ratio_ref_epsilon=float(eps),
-                    )
-                    # Append background values and DataFrame to outputs so UI updates
-                    return (*res[:8], out_tar_bg, out_ref_bg, res[3])  # res[3] is the DataFrame
-                integrate_btn.click(
-                    fn=_integrate_callback,
-                    inputs=[tgt, ref, masks_state, tgt_mask_state, ref_mask_state, tgt_chan, ref_chan, px_w, px_h, pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method, bak_tar, bak_ref, ratio_eps],
-                    outputs=[integrate_tar_overlay, integrate_ref_overlay, mask_tiff, table, csv_file, tgt_on_and_img, ref_on_and_img, ratio_img, bak_tar, bak_ref, quant_df_state],
-                )
+                # ==================== Wire up Step-by-Step callbacks ====================
+                stepbystep_components = {
+                    'tgt': tgt, 'ref': ref,
+                    'seg_source': seg_source, 'seg_chan': seg_chan, 'diameter': diameter,
+                    'flow_th': flow_th, 'cellprob_th': cellprob_th, 'use_gpu': use_gpu,
+                    'run_seg_btn': run_seg_btn, 'seg_overlay': seg_overlay, 'seg_tiff_file': seg_tiff_file,
+                    'mask_img': mask_img, 'masks_state': masks_state, 'prof_label': prof_label,
+                    'prof_cache_df_state': prof_cache_df_state, 'prof_cache_csv_state': prof_cache_csv_state,
+                    'prof_cache_plot_state': prof_cache_plot_state, 'prof_cache_params_state': prof_cache_params_state,
+                    'tgt_chan': tgt_chan, 'tgt_mask_mode': tgt_mask_mode, 'tgt_pct': tgt_pct,
+                    'tgt_sat_limit': tgt_sat_limit, 'tgt_min_obj': tgt_min_obj,
+                    'ref_chan': ref_chan, 'ref_mask_mode': ref_mask_mode, 'ref_pct': ref_pct,
+                    'ref_sat_limit': ref_sat_limit, 'ref_min_obj': ref_min_obj,
+                    'run_tgt_btn': run_tgt_btn, 'tgt_overlay': tgt_overlay, 'tgt_tiff': tgt_tiff,
+                    'tgt_mask_state': tgt_mask_state, 'ref_overlay': ref_overlay, 'ref_tiff': ref_tiff,
+                    'ref_mask_state': ref_mask_state,
+                    'pp_bg_enable': pp_bg_enable, 'pp_bg_mode': pp_bg_mode, 'pp_bg_radius': pp_bg_radius,
+                    'pp_dark_pct': pp_dark_pct, 'pp_norm_enable': pp_norm_enable, 'pp_norm_method': pp_norm_method,
+                    'bak_tar': bak_tar, 'bak_ref': bak_ref, 'ratio_eps': ratio_eps,
+                    'px_w': px_w, 'px_h': px_h,
+                    'integrate_btn': integrate_btn, 'integrate_tar_overlay': integrate_tar_overlay,
+                    'integrate_ref_overlay': integrate_ref_overlay, 'mask_tiff': mask_tiff,
+                    'table': table, 'csv_file': csv_file, 'tgt_on_and_img': tgt_on_and_img,
+                    'ref_on_and_img': ref_on_and_img, 'ratio_img': ratio_img, 'quant_df_state': quant_df_state,
+                    'rad_in': rad_in, 'rad_out': rad_out, 'rad_min_obj': rad_min_obj,
+                    'run_rad_btn': run_rad_btn, 'rad_overlay': rad_overlay,
+                    'radial_mask_state': radial_mask_state, 'radial_label_state': radial_label_state,
+                    'rad_tiff': rad_tiff, 'rad_lbl_tiff': rad_lbl_tiff,
+                    'radial_table': radial_table, 'radial_csv': radial_csv,
+                    'radial_tar_overlay': radial_tar_overlay, 'radial_ref_overlay': radial_ref_overlay,
+                    'radial_tgt_on_and_img': radial_tgt_on_and_img, 'radial_ref_on_and_img': radial_ref_on_and_img,
+                    'radial_ratio_img': radial_ratio_img, 'radial_quant_df_state': radial_quant_df_state,
+                    'prof_start': prof_start, 'prof_end': prof_end, 'prof_window_size': prof_window_size,
+                    'prof_window_step': prof_window_step, 'prof_smoothing': prof_smoothing, 'prof_show_err': prof_show_err,
+                    'run_prof_btn': run_prof_btn, 'profile_table': profile_table, 'profile_csv': profile_csv,
+                    'run_prof_single_btn': run_prof_single_btn, 'profile_plot': profile_plot,
+                    'peak_min_pct': peak_min_pct, 'peak_max_pct': peak_max_pct,
+                    'run_peak_diff_btn': run_peak_diff_btn, 'peak_diff_table': peak_diff_table,
+                    'peak_diff_csv': peak_diff_csv, 'peak_diff_state': peak_diff_state,
+                    'label_scale': label_scale,
+                }
+                create_stepbystep_callbacks(stepbystep_components)
 
                 # ---------------- Persist settings (Dual) ----------------
                 SETTINGS_KEY = "dcq_settings_v1"
@@ -648,6 +421,312 @@ def build_ui():
                     }}
                     """,
                 )
+            
+            # ==================== Tab 2: Radial Profile (Steps 1→2→3→5→6) ====================
+            with gr.TabItem("⚡ Radial Profile", id=1) as tab_radialprofile:
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("## Input Images")
+                        with gr.Row():
+                            tgt_quick = gr.Image(type="pil", label="Target image", image_mode="RGB", width=600)
+                            ref_quick = gr.Image(type="pil", label="Reference image", image_mode="RGB", width=600)
+                        
+                        gr.Markdown("## Settings")
+                        gr.Markdown("*⚙️ Settings are shared with Step-by-Step tab via browser storage*")
+                        
+                        with gr.Accordion("1. Segmentation settings", open=False):
+                            seg_source_q = gr.Radio(["target", "reference"], value="target", label="Segment on")
+                            seg_chan_q = gr.Radio(["gray", "R", "G", "B"], value="gray", label="Channel")
+                            diameter_q = gr.Slider(0, 200, value=0, step=1, label="Diameter (0=auto)")
+                            flow_th_q = gr.Slider(0.0, 1.5, value=0.4, step=0.05, label="Flow threshold")
+                            cellprob_th_q = gr.Slider(-6.0, 6.0, value=0.0, step=0.1, label="Cellprob threshold")
+                            use_gpu_q = gr.Checkbox(value=True, label="Use GPU")
+                        
+                        with gr.Accordion("2. Mask settings", open=False):
+                            with gr.Row():
+                                with gr.Column():
+                                    gr.Markdown("**Target**")
+                                    tgt_chan_q = gr.Radio(["gray", "R", "G", "B"], value="gray", label="Ch")
+                                    tgt_mask_mode_q = gr.Dropdown(
+                                        ["none", "global_percentile", "global_otsu", "per_cell_percentile", "per_cell_otsu"],
+                                        value="global_percentile", label="Mode")
+                                    tgt_pct_q = gr.Slider(0.0, 100.0, value=75.0, step=1.0, label="Pct")
+                                    tgt_sat_limit_q = gr.Slider(0, 255, value=254, step=1, label="Sat")
+                                    tgt_min_obj_q = gr.Slider(0, 2000, value=50, step=10, label="Min")
+                                with gr.Column():
+                                    gr.Markdown("**Reference**")
+                                    ref_chan_q = gr.Radio(["gray", "R", "G", "B"], value="gray", label="Ch")
+                                    ref_mask_mode_q = gr.Dropdown(
+                                        ["none", "global_percentile", "global_otsu", "per_cell_percentile", "per_cell_otsu"],
+                                        value="global_percentile", label="Mode")
+                                    ref_pct_q = gr.Slider(0.0, 100.0, value=75.0, step=1.0, label="Pct")
+                                    ref_sat_limit_q = gr.Slider(0, 255, value=254, step=1, label="Sat")
+                                    ref_min_obj_q = gr.Slider(0, 2000, value=50, step=10, label="Min")
+
+                        with gr.Accordion("3. Preprocessing settings", open=False):
+                            with gr.Column():
+                                pp_bg_enable_q = gr.Checkbox(value=False, label="Background correction")
+                                pp_bg_mode_q = gr.Dropdown(["rolling", "dark_subtract", "manual"], 
+                                                        value="dark_subtract", label="BG method")
+                                pp_bg_radius_q = gr.Slider(1, 300, value=50, step=1, label="Rolling radius")
+                                pp_dark_pct_q = gr.Slider(0.0, 50.0, value=5.0, step=0.5, label="Dark pct")
+                                with gr.Row():
+                                    bak_tar_q = gr.Number(value=1.0, label="Target BG")
+                                    bak_ref_q = gr.Number(value=1.0, label="Ref BG")
+                            with gr.Column():
+                                pp_norm_enable_q = gr.Checkbox(value=False, label="Normalization")
+                                pp_norm_method_q = gr.Dropdown(
+                                    ["z-score", "robust z-score", "min-max", "percentile [1,99]"],
+                                    value="min-max", label="Method")
+                            with gr.Column():
+                                ratio_eps_q = gr.Number(value=1e-6, label="Ratio epsilon")
+                                with gr.Row():
+                                    px_w_q = gr.Number(value=1.0, label="Pixel width (µm)")
+                                    px_h_q = gr.Number(value=1.0, label="Pixel height (µm)")
+                        
+                        with gr.Accordion("5. Radial profile settings", open=True):
+                            prof_start_q = gr.Number(value=0.0, label="Start %")
+                            prof_end_q = gr.Number(value=150.0, label="End %")
+                            prof_window_size_q = gr.Number(value=10.0, label="Window size %")
+                            prof_window_step_q = gr.Number(value=5.0, label="Window step %")
+                            prof_smoothing_q = gr.Number(value=1, label="Smoothing")
+                            prof_show_err_q = gr.Checkbox(value=True, label="Show error bars")
+                        
+                        with gr.Accordion("6. Peak analysis settings", open=True):
+                            peak_min_pct_q = gr.Number(value=60.0, label="Min %")
+                            peak_max_pct_q = gr.Number(value=120.0, label="Max %")
+                        
+                        
+                        gr.Markdown("---")
+                        gr.Markdown("## 🚀 Run Analysis")
+                        run_full_btn = gr.Button(
+                            "Run Full Pipeline (Steps 1→2→3→5→6)", 
+                            variant="primary", 
+                            size="lg"
+                        )
+                        progress_text = gr.Textbox(label="Progress", interactive=False, lines=6)
+                    
+                        gr.Markdown("## 📊 Results")
+                        with gr.Row():
+                            with gr.Column():
+                                with gr.Row():
+                                    integrate_tar_overlay = gr.Image(type="pil", label="Target overlay (AND mask)", width=600)
+                                    integrate_ref_overlay = gr.Image(type="pil", label="Reference overlay (AND mask)", width=600)
+                                # quant_table_q = gr.Dataframe(label="Per-cell quantification", 
+                                #                             interactive=False, pinned_columns=1)
+                                # quant_csv_q = gr.File(label="Download quantification CSV")
+                                quant_table_q=gr.State()
+                                quant_csv_q=gr.State()
+                        
+                        with gr.Tabs():
+
+                            with gr.TabItem("📈 Profile Plot"):
+                                prof_label_q = gr.Dropdown(choices=["All"], value="All", 
+                                                          label="Select cell", allow_custom_value=False)
+                                run_prof_single_btn_q = gr.Button("Update plot for selected cell")
+                                profile_plot_q = gr.Image(type="pil", label="Radial intensity profile", width=900)
+                            
+                            with gr.TabItem("📋 Profile Data"):
+                                profile_table_q = gr.Dataframe(label="Radial profile (all cells)", 
+                                                              interactive=False, pinned_columns=1)
+                                profile_csv_q = gr.File(label="Download profile CSV")
+                            
+
+                            with gr.TabItem("📍 Peak Analysis"):
+                                run_peak_diff_btn_q = gr.Button("Compute Peak Differences")
+                                peak_diff_table_q = gr.Dataframe(label="Peak differences", 
+                                                                interactive=False, pinned_columns=1)
+                                peak_diff_csv_q = gr.File(label="Download peak CSV")
+                
+                # ==================== Wire up Radial Profile callbacks ====================
+                radialprofile_components = {
+                    'tgt_quick': tgt_quick, 'ref_quick': ref_quick,
+                    'seg_source_q': seg_source_q, 'seg_chan_q': seg_chan_q, 'diameter_q': diameter_q,
+                    'flow_th_q': flow_th_q, 'cellprob_th_q': cellprob_th_q, 'use_gpu_q': use_gpu_q,
+                    'tgt_chan_q': tgt_chan_q, 'tgt_mask_mode_q': tgt_mask_mode_q, 'tgt_pct_q': tgt_pct_q,
+                    'tgt_sat_limit_q': tgt_sat_limit_q, 'tgt_min_obj_q': tgt_min_obj_q,
+                    'ref_chan_q': ref_chan_q, 'ref_mask_mode_q': ref_mask_mode_q, 'ref_pct_q': ref_pct_q,
+                    'ref_sat_limit_q': ref_sat_limit_q, 'ref_min_obj_q': ref_min_obj_q,
+                    'pp_bg_enable_q': pp_bg_enable_q, 'pp_bg_mode_q': pp_bg_mode_q, 'pp_bg_radius_q': pp_bg_radius_q,
+                    'pp_dark_pct_q': pp_dark_pct_q, 'bak_tar_q': bak_tar_q, 'bak_ref_q': bak_ref_q,
+                    'pp_norm_enable_q': pp_norm_enable_q, 'pp_norm_method_q': pp_norm_method_q,
+                    'prof_start_q': prof_start_q, 'prof_end_q': prof_end_q, 'prof_window_size_q': prof_window_size_q,
+                    'prof_window_step_q': prof_window_step_q, 'prof_smoothing_q': prof_smoothing_q, 'prof_show_err_q': prof_show_err_q,
+                    'peak_min_pct_q': peak_min_pct_q, 'peak_max_pct_q': peak_max_pct_q,
+                    'ratio_eps_q': ratio_eps_q, 'px_w_q': px_w_q, 'px_h_q': px_h_q,
+                    'run_full_btn': run_full_btn, 'progress_text': progress_text,
+                    'integrate_tar_overlay': integrate_tar_overlay, 'integrate_ref_overlay': integrate_ref_overlay,
+                    'quant_table_q': quant_table_q, 'quant_csv_q': quant_csv_q,
+                    'prof_label_q': prof_label_q, 'run_prof_single_btn_q': run_prof_single_btn_q,
+                    'profile_plot_q': profile_plot_q, 'profile_table_q': profile_table_q, 'profile_csv_q': profile_csv_q,
+                    'run_peak_diff_btn_q': run_peak_diff_btn_q, 'peak_diff_table_q': peak_diff_table_q, 'peak_diff_csv_q': peak_diff_csv_q,
+                    'masks_state': masks_state, 'quant_df_state': quant_df_state,
+                }
+                create_radialprofile_callbacks(radialprofile_components)
+                
+                # Load settings from localStorage on tab load (Radial Profile)
+                demo.load(
+                    fn=None,
+                    inputs=[],
+                    outputs=[
+                        seg_source_q, seg_chan_q, diameter_q, flow_th_q, cellprob_th_q, use_gpu_q,
+                        tgt_chan_q, tgt_mask_mode_q, tgt_pct_q, tgt_sat_limit_q, tgt_min_obj_q,
+                        ref_chan_q, ref_mask_mode_q, ref_pct_q, ref_sat_limit_q, ref_min_obj_q,
+                        pp_bg_enable_q, pp_bg_mode_q, pp_bg_radius_q, pp_dark_pct_q,
+                        pp_norm_enable_q, pp_norm_method_q,
+                        prof_start_q, prof_end_q, prof_window_size_q, prof_window_step_q,
+                        prof_smoothing_q, prof_show_err_q,
+                        peak_min_pct_q, peak_max_pct_q,
+                        ratio_eps_q, px_w_q, px_h_q,
+                    ],
+                    js=f"""
+                    () => {{
+                        try {{
+                            const raw = localStorage.getItem('{SETTINGS_KEY}');
+                            const d = {{
+                                seg_source: 'target', seg_chan: 'gray', diameter: 0, flow_th: 0.4, cellprob_th: 0.0, use_gpu: true,
+                                tgt_chan: 'gray', tgt_mask_mode: 'none', tgt_pct: 75.0, tgt_sat_limit: 254, tgt_min_obj: 50,
+                                ref_chan: 'gray', ref_mask_mode: 'none', ref_pct: 75.0, ref_sat_limit: 254, ref_min_obj: 50,
+                                pp_bg_enable: false, pp_bg_mode: 'dark_subtract', pp_bg_radius: 50, pp_dark_pct: 5.0,
+                                pp_norm_enable: false, pp_norm_method: 'min-max',
+                                prof_start: 0.0, prof_end: 150.0, prof_window_size: 10.0, prof_window_step: 5.0,
+                                prof_smoothing: 1, prof_show_err: true,
+                                peak_min_pct: 60.0, peak_max_pct: 120.0,
+                                ratio_eps: 1e-6, px_w: 1.0, px_h: 1.0,
+                            }};
+                            let s = raw ? {{...d, ...JSON.parse(raw)}} : d;
+                            const mapChan = (v) => ({{0:'gray',1:'R',2:'G',3:'B'}})[v] ?? v;
+                            s.seg_chan = mapChan(s.seg_chan);
+                            s.tgt_chan = mapChan(s.tgt_chan);
+                            s.ref_chan = mapChan(s.ref_chan);
+                            return [
+                                s.seg_source, s.seg_chan, s.diameter, s.flow_th, s.cellprob_th, s.use_gpu,
+                                s.tgt_chan, s.tgt_mask_mode, s.tgt_pct, s.tgt_sat_limit, s.tgt_min_obj,
+                                s.ref_chan, s.ref_mask_mode, s.ref_pct, s.ref_sat_limit, s.ref_min_obj,
+                                s.pp_bg_enable, s.pp_bg_mode, s.pp_bg_radius, s.pp_dark_pct,
+                                s.pp_norm_enable, s.pp_norm_method,
+                                s.prof_start, s.prof_end, s.prof_window_size, s.prof_window_step,
+                                s.prof_smoothing, s.prof_show_err,
+                                s.peak_min_pct, s.peak_max_pct,
+                                s.ratio_eps, s.px_w, s.px_h,
+                            ];
+                        }} catch (e) {{
+                            console.warn('Failed to load saved settings:', e);
+                            return Array(31).fill(null);
+                        }}
+                    }}
+                    """,
+                )
+        
+        # ==================== Tab Switch Events: Reload Settings ====================
+        # When switching to Step-by-Step tab, reload settings from localStorage
+        tab_stepbystep.select(
+            fn=None,
+            inputs=[],
+            outputs=[
+                seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu,
+                tgt_chan, tgt_mask_mode, tgt_pct, tgt_sat_limit, tgt_min_obj,
+                ref_chan, ref_mask_mode, ref_pct, ref_sat_limit, ref_min_obj,
+                pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct,
+                pp_norm_enable, pp_norm_method,
+                prof_start, prof_end, prof_window_size, prof_window_step,
+                prof_smoothing, prof_show_err,
+                peak_min_pct, peak_max_pct,
+                ratio_eps, px_w, px_h,
+            ],
+            js=f"""
+            () => {{
+                try {{
+                    const raw = localStorage.getItem('{SETTINGS_KEY}');
+                    const d = {{
+                        seg_source: 'target', seg_chan: 'gray', diameter: 0, flow_th: 0.4, cellprob_th: 0.0, use_gpu: true,
+                        tgt_chan: 'gray', tgt_mask_mode: 'none', tgt_pct: 75.0, tgt_sat_limit: 254, tgt_min_obj: 50,
+                        ref_chan: 'gray', ref_mask_mode: 'none', ref_pct: 75.0, ref_sat_limit: 254, ref_min_obj: 50,
+                        pp_bg_enable: false, pp_bg_mode: 'dark_subtract', pp_bg_radius: 50, pp_dark_pct: 5.0,
+                        pp_norm_enable: false, pp_norm_method: 'min-max',
+                        prof_start: 0.0, prof_end: 150.0, prof_window_size: 10.0, prof_window_step: 5.0,
+                        prof_smoothing: 1, prof_show_err: true,
+                        peak_min_pct: 60.0, peak_max_pct: 120.0,
+                        ratio_eps: 1e-6, px_w: 1.0, px_h: 1.0,
+                    }};
+                    let s = raw ? {{...d, ...JSON.parse(raw)}} : d;
+                    const mapChan = (v) => ({{0:'gray',1:'R',2:'G',3:'B'}})[v] ?? v;
+                    s.seg_chan = mapChan(s.seg_chan);
+                    s.tgt_chan = mapChan(s.tgt_chan);
+                    s.ref_chan = mapChan(s.ref_chan);
+                    return [
+                        s.seg_source, s.seg_chan, s.diameter, s.flow_th, s.cellprob_th, s.use_gpu,
+                        s.tgt_chan, s.tgt_mask_mode, s.tgt_pct, s.tgt_sat_limit, s.tgt_min_obj,
+                        s.ref_chan, s.ref_mask_mode, s.ref_pct, s.ref_sat_limit, s.ref_min_obj,
+                        s.pp_bg_enable, s.pp_bg_mode, s.pp_bg_radius, s.pp_dark_pct,
+                        s.pp_norm_enable, s.pp_norm_method,
+                        s.prof_start, s.prof_end, s.prof_window_size, s.prof_window_step,
+                        s.prof_smoothing, s.prof_show_err,
+                        s.peak_min_pct, s.peak_max_pct,
+                        s.ratio_eps, s.px_w, s.px_h,
+                    ];
+                }} catch (e) {{
+                    console.warn('Failed to reload settings on tab switch:', e);
+                    return Array(31).fill(null);
+                }}
+            }}
+            """,
+        )
+        
+        # When switching to Radial Profile tab, reload settings from localStorage
+        tab_radialprofile.select(
+            fn=None,
+            inputs=[],
+            outputs=[
+                seg_source_q, seg_chan_q, diameter_q, flow_th_q, cellprob_th_q, use_gpu_q,
+                tgt_chan_q, tgt_mask_mode_q, tgt_pct_q, tgt_sat_limit_q, tgt_min_obj_q,
+                ref_chan_q, ref_mask_mode_q, ref_pct_q, ref_sat_limit_q, ref_min_obj_q,
+                pp_bg_enable_q, pp_bg_mode_q, pp_bg_radius_q, pp_dark_pct_q,
+                pp_norm_enable_q, pp_norm_method_q,
+                prof_start_q, prof_end_q, prof_window_size_q, prof_window_step_q,
+                prof_smoothing_q, prof_show_err_q,
+                peak_min_pct_q, peak_max_pct_q,
+                ratio_eps_q, px_w_q, px_h_q,
+            ],
+            js=f"""
+            () => {{
+                try {{
+                    const raw = localStorage.getItem('{SETTINGS_KEY}');
+                    const d = {{
+                        seg_source: 'target', seg_chan: 'gray', diameter: 0, flow_th: 0.4, cellprob_th: 0.0, use_gpu: true,
+                        tgt_chan: 'gray', tgt_mask_mode: 'none', tgt_pct: 75.0, tgt_sat_limit: 254, tgt_min_obj: 50,
+                        ref_chan: 'gray', ref_mask_mode: 'none', ref_pct: 75.0, ref_sat_limit: 254, ref_min_obj: 50,
+                        pp_bg_enable: false, pp_bg_mode: 'dark_subtract', pp_bg_radius: 50, pp_dark_pct: 5.0,
+                        pp_norm_enable: false, pp_norm_method: 'min-max',
+                        prof_start: 0.0, prof_end: 150.0, prof_window_size: 10.0, prof_window_step: 5.0,
+                        prof_smoothing: 1, prof_show_err: true,
+                        peak_min_pct: 60.0, peak_max_pct: 120.0,
+                        ratio_eps: 1e-6, px_w: 1.0, px_h: 1.0,
+                    }};
+                    let s = raw ? {{...d, ...JSON.parse(raw)}} : d;
+                    const mapChan = (v) => ({{0:'gray',1:'R',2:'G',3:'B'}})[v] ?? v;
+                    s.seg_chan = mapChan(s.seg_chan);
+                    s.tgt_chan = mapChan(s.tgt_chan);
+                    s.ref_chan = mapChan(s.ref_chan);
+                    return [
+                        s.seg_source, s.seg_chan, s.diameter, s.flow_th, s.cellprob_th, s.use_gpu,
+                        s.tgt_chan, s.tgt_mask_mode, s.tgt_pct, s.tgt_sat_limit, s.tgt_min_obj,
+                        s.ref_chan, s.ref_mask_mode, s.ref_pct, s.ref_sat_limit, s.ref_min_obj,
+                        s.pp_bg_enable, s.pp_bg_mode, s.pp_bg_radius, s.pp_dark_pct,
+                        s.pp_norm_enable, s.pp_norm_method,
+                        s.prof_start, s.prof_end, s.prof_window_size, s.prof_window_step,
+                        s.prof_smoothing, s.prof_show_err,
+                        s.peak_min_pct, s.peak_max_pct,
+                        s.ratio_eps, s.px_w, s.px_h,
+                    ];
+                }} catch (e) {{
+                    console.warn('Failed to reload settings on tab switch:', e);
+                    return Array(31).fill(null);
+                }}
+            }}
+            """,
+        )
+    
     return demo
 
 
