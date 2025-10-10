@@ -15,3 +15,5 @@ __pycache__/
 
 *.ubuntu
 poetry.lock
+REFACTORING_COMPLETE.md
+README_REFACTOR.md
