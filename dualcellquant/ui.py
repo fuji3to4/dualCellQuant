@@ -29,9 +29,9 @@ def build_ui():
 
 
             1. Run Cellpose-SAM to obtain segmentation masks.
-            2. Build Radial mask (optional).
-            3. Apply Target/Reference masks.
-            4. Integrate (Preprocess applied only here) and view results.
+            2. Apply Target/Reference masks.
+            3. Integrate (Preprocess applied only here) and view results.
+            4. Build Radial mask & Quantify
             
             **📋 Step-by-Step**: Detailed control (Steps 1→2→3→4)  
             **⚡ Radial Profile**: 
