@@ -239,7 +239,27 @@ def run_segmentation(
     flow_threshold: float,
     cellprob_threshold: float,
     use_gpu: bool,
+    drop_edge_cells: bool = True,
+    inside_fraction_min: float = 0.9,
+    edge_margin_pct: float = 0.0,
 ):
+    """Run Cellpose-SAM segmentation and optionally drop edge-touching cells.
+
+    The previous logic removed any cell whose bounding box touched the image border.
+    This was sometimes too strict: cells barely touching the border (e.g. one or two
+    pixels) were discarded despite >90% of the cell area lying inside the field.
+
+    New rule when drop_edge_cells=True:
+        For each labeled cell we compute:
+            near_border_pixels = count of cell pixels that lie within edge_margin_pct (%) from the image border
+            area_pixels   = total cell pixels
+            inside_fraction = 1 - near_border_pixels / area_pixels
+        We only DROP the cell if inside_fraction < inside_fraction_min (default 0.9).
+
+    This keeps cells that are mostly interior, while removing those largely truncated
+    at the border. If desired, inside_fraction_min can be adjusted (e.g. 0.95 for stricter
+    filtering or 0.8 for more permissive).
+    """
     tgt = pil_to_numpy(target_img)
     ref = pil_to_numpy(reference_img)
     if tgt.shape[:2] != ref.shape[:2]:
@@ -264,6 +284,46 @@ def run_segmentation(
         masks, flows, styles = result
     else:
         raise ValueError("Unexpected return values from model.eval")
+    # Optionally drop cells that touch image borders and relabel to compact integers
+    if drop_edge_cells and isinstance(masks, np.ndarray) and masks.ndim == 2 and masks.size > 0:
+        H, W = masks.shape
+        # Convert percentage margin to pixel margins per axis
+        m_r = int(max(0, np.floor((float(edge_margin_pct) / 100.0) * H)))
+        m_c = int(max(0, np.floor((float(edge_margin_pct) / 100.0) * W)))
+        n_labels = int(masks.max())
+        keep = np.ones(n_labels + 1, dtype=bool)
+        keep[0] = False
+        try:
+            props = measure.regionprops(masks)
+            for p in props:
+                lab = int(p.label)
+                coords = p.coords  # (N, 2) array of (row, col)
+                if coords.size == 0:
+                    keep[lab] = False
+                    continue
+                rows = coords[:, 0]; cols = coords[:, 1]
+                # Count pixels within the specified margin from the border
+                if (m_r <= 0) and (m_c <= 0):
+                    near_mask = (rows == 0) | (rows == H - 1) | (cols == 0) | (cols == W - 1)
+                else:
+                    near_mask = (rows < m_r) | (rows > H - 1 - m_r) | (cols < m_c) | (cols > W - 1 - m_c)
+                border_pixels = int(np.count_nonzero(near_mask))
+                area_pixels = int(coords.shape[0])
+                inside_fraction = 1.0 - (border_pixels / area_pixels) if area_pixels > 0 else 0.0
+                if inside_fraction < float(inside_fraction_min):
+                    keep[lab] = False
+        except Exception:
+            # Fallback (rare): simple edge-touching removal using dilation of border
+            edge_mask = np.zeros_like(masks, dtype=bool)
+            edge_mask[0, :] = True; edge_mask[-1, :] = True; edge_mask[:, 0] = True; edge_mask[:, -1] = True
+            labs_on_edge = np.unique(masks[edge_mask])
+            for lab in labs_on_edge:
+                if lab > 0:
+                    keep[int(lab)] = False
+        # Apply filter & relabel compactly
+        filt = np.where(keep[masks], masks, 0)
+        masks = measure.label(filt > 0, connectivity=1)
+
     overlay = colorize_overlay(seg_gray, masks, None)
     overlay = annotate_ids(overlay, masks)
     mask_viz = vivid_label_image(masks)

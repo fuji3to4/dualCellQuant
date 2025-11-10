@@ -130,14 +130,17 @@ def create_stepbystep_callbacks(components):
     # ==================== Callback Functions ====================
     
     # Segmentation
-    def _run_seg(tgt_img, ref_img, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu):
-        ov, seg_tif, mask_viz, masks = run_segmentation(tgt_img, ref_img, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu)
+    def _run_seg(tgt_img, ref_img, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu, drop_edge):
+        ov, seg_tif, mask_viz, masks = run_segmentation(
+            tgt_img, ref_img, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu,
+            drop_edge_cells=bool(drop_edge), inside_fraction_min=0.98, edge_margin_pct=1.0,
+        )
         # no label dropdown to update; just reset caches
         return ov, seg_tif, mask_viz, masks, None, None, None, None
     
     run_seg_btn.click(
         fn=_run_seg,
-        inputs=[tgt, ref, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu],
+        inputs=[tgt, ref, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu, components['seg_drop_edge']],
         outputs=[seg_overlay, seg_tiff_file, mask_img, masks_state, prof_cache_df_state, prof_cache_csv_state, prof_cache_plot_state, prof_cache_params_state],
     )
     
@@ -329,8 +332,12 @@ def create_stepbystep_callbacks(components):
                 if 'mean_ratio_T_over_R' in g.columns:
                     g['mean_ratio_T_over_R'] = _smooth_arr(g['mean_ratio_T_over_R'].to_numpy(dtype=float))
                 return g
-            out = df.groupby('label', as_index=False, group_keys=False).apply(_smooth_group)
-            return out.reset_index(drop=True)
+            # Avoid FutureWarning from pandas GroupBy.apply including grouping columns
+            parts = []
+            for _, g in df.groupby('label', sort=False):
+                parts.append(_smooth_group(g))
+            out = pd.concat(parts, ignore_index=True) if parts else df.copy()
+            return out
         except Exception:
             return df.copy()
     
@@ -353,6 +360,21 @@ def create_stepbystep_callbacks(components):
         except Exception:
             slope_rel = 0.001
         peak_df = compute_radial_peak_difference(cached_df, quant_df, float(min_pct), float(max_pct), algo=algo, sg_window=w, sg_poly=p, peak_slope_eps_rel=slope_rel)
+        # Ensure intensity columns are present and column order is user-friendly
+        try:
+            preferred_cols = [
+                "label",
+                "max_target_center_pct", "max_reference_center_pct", "difference_pct",
+                "max_target_px", "max_reference_px", "difference_px",
+                "max_target_um", "max_reference_um", "difference_um",
+                "max_target_intensity", "max_reference_intensity", "ratio_intensity",
+                # Reference RAW quality metrics
+                "ref_range_rel", "ref_noise_rel", "ref_neg_run_after_peak", "accept_ref",
+            ]
+            cols = [c for c in preferred_cols if c in peak_df.columns] + [c for c in peak_df.columns if c not in preferred_cols]
+            peak_df = peak_df[cols]
+        except Exception:
+            pass
         
         if peak_df.empty:
             return gr.update(value=pd.DataFrame()), None, gr.update(), None

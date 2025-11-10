@@ -100,7 +100,7 @@ def create_radialprofile_callbacks(components):
     # ==================== Callback Functions ====================
     
     # Full pipeline callback
-    def _run_full_pipeline(tgt_img, ref_img, seg_src, seg_ch, diam, flow, cellprob, gpu,
+    def _run_full_pipeline(tgt_img, ref_img, seg_src, seg_ch, diam, flow, cellprob, gpu, drop_edge,
                           t_ch, t_mode, t_pct, t_sat, t_min,
                           r_ch, r_mode, r_pct, r_sat, r_min,
                           bg_en, bg_mode, bg_rad, dark_pct, bg_t, bg_r, nm_en, nm_m,
@@ -137,7 +137,8 @@ def create_radialprofile_callbacks(components):
             )
             
             _, _, _, masks = run_segmentation(
-                tgt_img, ref_img, seg_src, seg_ch, diam, flow, cellprob, gpu
+                tgt_img, ref_img, seg_src, seg_ch, diam, flow, cellprob, gpu,
+                drop_edge_cells=bool(drop_edge), inside_fraction_min=0.98, edge_margin_pct=1.0,
             )
             progress[-1] = "✅ Step 1/5: Segmentation complete"
             yield (
@@ -350,7 +351,7 @@ def create_radialprofile_callbacks(components):
     run_full_btn.click(
         fn=_run_full_pipeline,
         inputs=[
-            tgt_quick, ref_quick, seg_source_q, seg_chan_q, diameter_q, flow_th_q, cellprob_th_q, use_gpu_q,
+            tgt_quick, ref_quick, seg_source_q, seg_chan_q, diameter_q, flow_th_q, cellprob_th_q, use_gpu_q, components['seg_drop_edge_q'],
             tgt_chan_q, tgt_mask_mode_q, tgt_pct_q, tgt_sat_limit_q, tgt_min_obj_q,
             ref_chan_q, ref_mask_mode_q, ref_pct_q, ref_sat_limit_q, ref_min_obj_q,
             pp_bg_enable_q, pp_bg_mode_q, pp_bg_radius_q, pp_dark_pct_q, bak_tar_q, bak_ref_q,
@@ -494,6 +495,21 @@ def create_radialprofile_callbacks(components):
         except Exception:
             slope_rel = 0.001
         peak_df = compute_radial_peak_difference(cache_df, quant_df, float(min_pct), float(max_pct), algo=algo, sg_window=w, sg_poly=p, peak_slope_eps_rel=slope_rel)
+        # Ensure intensity columns are present and column order is user-friendly
+        try:
+            preferred_cols = [
+                "label",
+                "max_target_center_pct", "max_reference_center_pct", "difference_pct",
+                "max_target_px", "max_reference_px", "difference_px",
+                "max_target_um", "max_reference_um", "difference_um",
+                "max_target_intensity", "max_reference_intensity", "ratio_intensity",
+                # Reference RAW quality metrics
+                "ref_range_rel", "ref_noise_rel", "ref_neg_run_after_peak", "accept_ref",
+            ]
+            cols = [c for c in preferred_cols if c in peak_df.columns] + [c for c in peak_df.columns if c not in preferred_cols]
+            peak_df = peak_df[cols]
+        except Exception:
+            pass
         
         if peak_df.empty:
             return gr.update(value=pd.DataFrame()), None, gr.update(), None
@@ -561,8 +577,12 @@ def create_radialprofile_callbacks(components):
                 if 'mean_ratio_T_over_R' in g.columns:
                     g['mean_ratio_T_over_R'] = _smooth_arr(g['mean_ratio_T_over_R'].to_numpy(dtype=float))
                 return g
-            out = df.groupby('label', as_index=False, group_keys=False).apply(_smooth_group)
-            return out.reset_index(drop=True)
+            # Avoid FutureWarning from pandas GroupBy.apply including grouping columns
+            parts = []
+            for _, g in df.groupby('label', sort=False):
+                parts.append(_smooth_group(g))
+            out = pd.concat(parts, ignore_index=True) if parts else df.copy()
+            return out
         except Exception:
             return df.copy()
 

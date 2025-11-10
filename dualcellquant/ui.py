@@ -83,7 +83,8 @@ def build_ui():
                             diameter = gr.Slider(0, 200, value=0, step=1, label="Diameter (px, 0=auto)")
                             flow_th = gr.Slider(0.0, 1.5, value=0.4, step=0.05, label="Flow threshold")
                             cellprob_th = gr.Slider(-6.0, 6.0, value=0.0, step=0.1, label="Cellprob threshold")
-                            use_gpu = gr.Checkbox(value=True, label="Use GPU if available")           
+                            use_gpu = gr.Checkbox(value=True, label="Use GPU if available")
+                            seg_drop_edge = gr.Checkbox(value=True, label="Exclude edge-touching labels")           
                                 
                         run_seg_btn = gr.Button("1. Run Cellpose")
                         
@@ -91,6 +92,10 @@ def build_ui():
                             seg_overlay = gr.Image(type="pil", label="Segmentation overlay", width=600)
                             mask_img = gr.Image(type="pil", label="Segmentation label image", width=600)
                         seg_tiff_file = gr.File(label="Download masks (label TIFF)")
+                        with gr.Accordion("Maintain IDs across frames", open=False):
+                            prev_label_tiff = gr.File(label="Previous labels (label TIFF)")
+                            iou_match_th = gr.Slider(0.0, 1.0, value=0.2, step=0.05, label="IoU threshold for ID match")
+                            relabel_btn = gr.Button("Relabel current masks to previous IDs")
                         # Radial mask controls are moved to the bottom (after Integrate)
                         gr.Markdown("## 2. Apply Masks")
                         with gr.Accordion("Apply mask", open=True):
@@ -245,9 +250,10 @@ def build_ui():
                 stepbystep_components = {
                     'tgt': tgt, 'ref': ref,
                     'seg_source': seg_source, 'seg_chan': seg_chan, 'diameter': diameter,
-                    'flow_th': flow_th, 'cellprob_th': cellprob_th, 'use_gpu': use_gpu,
+                    'flow_th': flow_th, 'cellprob_th': cellprob_th, 'use_gpu': use_gpu, 'seg_drop_edge': seg_drop_edge,
                     'run_seg_btn': run_seg_btn, 'seg_overlay': seg_overlay, 'seg_tiff_file': seg_tiff_file,
                     'mask_img': mask_img, 'masks_state': masks_state,
+                    'prev_label_tiff': prev_label_tiff, 'iou_match_th': iou_match_th, 'relabel_btn': relabel_btn,
                     'prof_cache_df_state': prof_cache_df_state, 'prof_cache_csv_state': prof_cache_csv_state,
                     'prof_cache_plot_state': prof_cache_plot_state, 'prof_cache_params_state': prof_cache_params_state,
                     'tgt_chan': tgt_chan, 'tgt_mask_mode': tgt_mask_mode, 'tgt_pct': tgt_pct,
@@ -293,11 +299,13 @@ def build_ui():
                     fn=None,
                     inputs=[],
                     outputs=[
-                        seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu,
+                        seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu, seg_drop_edge,
                         pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method,
                         rad_in, rad_out, rad_min_obj,
-                        tgt_chan, tgt_mask_mode, tgt_sat_limit, tgt_pct, tgt_min_obj,
-                        ref_chan, ref_mask_mode, ref_sat_limit, ref_pct, ref_min_obj,
+                        # Target mask: channel, mode, pct, sat_limit, min_obj (standardized order)
+                        tgt_chan, tgt_mask_mode, tgt_pct, tgt_sat_limit, tgt_min_obj,
+                        # Reference mask: channel, mode, pct, sat_limit, min_obj
+                        ref_chan, ref_mask_mode, ref_pct, ref_sat_limit, ref_min_obj,
                         px_w, px_h,
                         prof_start, prof_end, prof_window_size, prof_window_step, prof_smoothing, prof_show_err, profile_show_ratio,
                         peak_min_pct, peak_max_pct, peak_algo, sg_window, sg_poly, peak_slope_eps_rel,
@@ -309,7 +317,7 @@ def build_ui():
                         try {{
                             const raw = localStorage.getItem('{SETTINGS_KEY}');
                             const d = {{
-                                seg_source: 'target', seg_chan: 'gray', diameter: 0, flow_th: 0.4, cellprob_th: 0.0, use_gpu: true,
+                                seg_source: 'target', seg_chan: 'gray', diameter: 0, flow_th: 0.4, cellprob_th: 0.0, use_gpu: true, seg_drop_edge: true,
                                 pp_bg_enable: false, pp_bg_mode: 'rolling', pp_bg_radius: 50, pp_dark_pct: 5.0, pp_norm_enable: false, pp_norm_method: 'z-score',
                                 rad_in: 0.0, rad_out: 100.0, rad_min_obj: 50,
                                 tgt_chan: 'gray', tgt_mask_mode: 'global_percentile', tgt_sat_limit: 254, tgt_pct: 75.0, tgt_min_obj: 50,
@@ -334,6 +342,7 @@ def build_ui():
                                 s.flow_th,
                                 s.cellprob_th,
                                 s.use_gpu,
+                                s.seg_drop_edge,
                                 s.pp_bg_enable,
                                 s.pp_bg_mode,
                                 s.pp_bg_radius,
@@ -343,15 +352,17 @@ def build_ui():
                                 s.rad_in,
                                 s.rad_out,
                                 s.rad_min_obj,
+                                // Target mask standardized ordering
                                 s.tgt_chan,
                                 s.tgt_mask_mode,
-                                s.tgt_sat_limit,
                                 s.tgt_pct,
+                                s.tgt_sat_limit,
                                 s.tgt_min_obj,
+                                // Reference mask standardized ordering
                                 s.ref_chan,
                                 s.ref_mask_mode,
-                                s.ref_sat_limit,
                                 s.ref_pct,
+                                s.ref_sat_limit,
                                 s.ref_min_obj,
                                 s.px_w,
                                 s.px_h,
@@ -374,11 +385,11 @@ def build_ui():
                         }} catch (e) {{
                             console.warn('Failed to load saved settings:', e);
                             return [
-                                'target', 'gray', 0, 0.4, 0.0, true,
+                                'target', 'gray', 0, 0.4, 0.0, true, true,
                                 false, 'rolling', 50, 5.0, false, 'z-score',
                                 0.0, 100.0, 50,
-                                'gray', 'global_percentile', 254, 75.0, 50,
-                                'gray', 'global_percentile', 254, 75.0, 50,
+                                'gray', 'global_percentile', 75.0, 254, 50,
+                                'gray', 'global_percentile', 75.0, 254, 50,
                                 1.0, 1.0,
                                 0.0, 150.0, 10.0, 5.0, 1, true, true,
                                 60.0, 120.0, 'global_max', 5, 2, 0.001,
@@ -411,7 +422,7 @@ def build_ui():
                     )
 
                 for comp, key in [
-                    (seg_source, 'seg_source'), (seg_chan, 'seg_chan'), (diameter, 'diameter'), (flow_th, 'flow_th'), (cellprob_th, 'cellprob_th'), (use_gpu, 'use_gpu'),
+                    (seg_source, 'seg_source'), (seg_chan, 'seg_chan'), (diameter, 'diameter'), (flow_th, 'flow_th'), (cellprob_th, 'cellprob_th'), (use_gpu, 'use_gpu'), (seg_drop_edge, 'seg_drop_edge'),
                     (pp_bg_enable, 'pp_bg_enable'), (pp_bg_mode, 'pp_bg_mode'), (pp_bg_radius, 'pp_bg_radius'), (pp_dark_pct, 'pp_dark_pct'), (pp_norm_enable, 'pp_norm_enable'), (pp_norm_method, 'pp_norm_method'),
                     (rad_in, 'rad_in'), (rad_out, 'rad_out'), (rad_min_obj, 'rad_min_obj'),
                     (tgt_chan, 'tgt_chan'), (tgt_mask_mode, 'tgt_mask_mode'), (tgt_sat_limit, 'tgt_sat_limit'), (tgt_pct, 'tgt_pct'), (tgt_min_obj, 'tgt_min_obj'),
@@ -453,11 +464,11 @@ def build_ui():
                     fn=None,
                     inputs=[],
                     outputs=[
-                        seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu,
+                        seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu, seg_drop_edge,
                         pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct, pp_norm_enable, pp_norm_method,
                         rad_in, rad_out, rad_min_obj,
-                        tgt_chan, tgt_mask_mode, tgt_sat_limit, tgt_pct, tgt_min_obj,
-                        ref_chan, ref_mask_mode, ref_sat_limit, ref_pct, ref_min_obj,
+                        tgt_chan, tgt_mask_mode, tgt_pct, tgt_sat_limit, tgt_min_obj,
+                        ref_chan, ref_mask_mode, ref_pct, ref_sat_limit, ref_min_obj,
                         px_w, px_h,
                         prof_start, prof_end, prof_window_size, prof_window_step, prof_smoothing, prof_show_err, profile_show_ratio,
                         peak_min_pct, peak_max_pct, peak_algo, sg_window, sg_poly, peak_slope_eps_rel, ratio_eps,
@@ -472,11 +483,11 @@ def build_ui():
                         }}
                         alert('Saved settings cleared. Restoring defaults.');
                         return [
-                            'target', 'gray', 0, 0.4, 0.0, true,
+                            'target', 'gray', 0, 0.4, 0.0, true, true,
                             false, 'dark_subtract', 50, 5.0, false, 'min-max',
                             0.0, 100.0, 50,
-                            'gray', 'none', 254, 75.0, 50,
-                            'gray', 'none', 254, 75.0, 50,
+                            'gray', 'none', 75.0, 254, 50,
+                            'gray', 'none', 75.0, 254, 50,
                             1.0, 1.0,
                             0.0, 150.0, 10.0, 5.0, 1, true, true,
                             60.0, 120.0, 'global_max', 5, 2, 0.001, {float(1e-6)},
@@ -505,6 +516,7 @@ def build_ui():
                             flow_th_q = gr.Slider(0.0, 1.5, value=0.4, step=0.05, label="Flow threshold")
                             cellprob_th_q = gr.Slider(-6.0, 6.0, value=0.0, step=0.1, label="Cellprob threshold")
                             use_gpu_q = gr.Checkbox(value=True, label="Use GPU")
+                            seg_drop_edge_q = gr.Checkbox(value=True, label="Exclude edge-touching labels")
                         
                         with gr.Accordion("2. Mask settings", open=False):
                             with gr.Row():
@@ -634,7 +646,7 @@ def build_ui():
                 radialprofile_components = {
                     'tgt_quick': tgt_quick, 'ref_quick': ref_quick,
                     'seg_source_q': seg_source_q, 'seg_chan_q': seg_chan_q, 'diameter_q': diameter_q,
-                    'flow_th_q': flow_th_q, 'cellprob_th_q': cellprob_th_q, 'use_gpu_q': use_gpu_q,
+                    'flow_th_q': flow_th_q, 'cellprob_th_q': cellprob_th_q, 'use_gpu_q': use_gpu_q, 'seg_drop_edge_q': seg_drop_edge_q,
                     'tgt_chan_q': tgt_chan_q, 'tgt_mask_mode_q': tgt_mask_mode_q, 'tgt_pct_q': tgt_pct_q,
                     'tgt_sat_limit_q': tgt_sat_limit_q, 'tgt_min_obj_q': tgt_min_obj_q,
                     'ref_chan_q': ref_chan_q, 'ref_mask_mode_q': ref_mask_mode_q, 'ref_pct_q': ref_pct_q,
@@ -666,7 +678,7 @@ def build_ui():
                     fn=None,
                     inputs=[],
                     outputs=[
-                        seg_source_q, seg_chan_q, diameter_q, flow_th_q, cellprob_th_q, use_gpu_q,
+                        seg_source_q, seg_chan_q, diameter_q, flow_th_q, cellprob_th_q, use_gpu_q, seg_drop_edge_q,
                         tgt_chan_q, tgt_mask_mode_q, tgt_pct_q, tgt_sat_limit_q, tgt_min_obj_q,
                         ref_chan_q, ref_mask_mode_q, ref_pct_q, ref_sat_limit_q, ref_min_obj_q,
                         pp_bg_enable_q, pp_bg_mode_q, pp_bg_radius_q, pp_dark_pct_q,
@@ -681,7 +693,7 @@ def build_ui():
                         try {{
                             const raw = localStorage.getItem('{SETTINGS_KEY}');
                             const d = {{
-                                seg_source: 'target', seg_chan: 'gray', diameter: 0, flow_th: 0.4, cellprob_th: 0.0, use_gpu: true,
+                                seg_source: 'target', seg_chan: 'gray', diameter: 0, flow_th: 0.4, cellprob_th: 0.0, use_gpu: true, seg_drop_edge: true,
                                 tgt_chan: 'gray', tgt_mask_mode: 'none', tgt_pct: 75.0, tgt_sat_limit: 254, tgt_min_obj: 50,
                                 ref_chan: 'gray', ref_mask_mode: 'none', ref_pct: 75.0, ref_sat_limit: 254, ref_min_obj: 50,
                                 pp_bg_enable: false, pp_bg_mode: 'dark_subtract', pp_bg_radius: 50, pp_dark_pct: 5.0,
@@ -699,7 +711,7 @@ def build_ui():
                             // sanitize deprecated algo
                             if (s.peak_algo === 'first_shoulder') s.peak_algo = 'first_local_top';
                             return [
-                                s.seg_source, s.seg_chan, s.diameter, s.flow_th, s.cellprob_th, s.use_gpu,
+                                s.seg_source, s.seg_chan, s.diameter, s.flow_th, s.cellprob_th, s.use_gpu, s.seg_drop_edge,
                                 s.tgt_chan, s.tgt_mask_mode, s.tgt_pct, s.tgt_sat_limit, s.tgt_min_obj,
                                 s.ref_chan, s.ref_mask_mode, s.ref_pct, s.ref_sat_limit, s.ref_min_obj,
                                 s.pp_bg_enable, s.pp_bg_mode, s.pp_bg_radius, s.pp_dark_pct,
@@ -742,7 +754,7 @@ def build_ui():
                 
                 for comp, key in [
                     (seg_source_q, 'seg_source'), (seg_chan_q, 'seg_chan'), (diameter_q, 'diameter'), 
-                    (flow_th_q, 'flow_th'), (cellprob_th_q, 'cellprob_th'), (use_gpu_q, 'use_gpu'),
+                    (flow_th_q, 'flow_th'), (cellprob_th_q, 'cellprob_th'), (use_gpu_q, 'use_gpu'), (seg_drop_edge_q, 'seg_drop_edge'),
                     (tgt_chan_q, 'tgt_chan'), (tgt_mask_mode_q, 'tgt_mask_mode'), (tgt_pct_q, 'tgt_pct'),
                     (tgt_sat_limit_q, 'tgt_sat_limit'), (tgt_min_obj_q, 'tgt_min_obj'),
                     (ref_chan_q, 'ref_chan'), (ref_mask_mode_q, 'ref_mask_mode'), (ref_pct_q, 'ref_pct'),
@@ -764,13 +776,13 @@ def build_ui():
             fn=None,
             inputs=[],
             outputs=[
-                seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu,
+                seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu, seg_drop_edge,
                 tgt_chan, tgt_mask_mode, tgt_pct, tgt_sat_limit, tgt_min_obj,
                 ref_chan, ref_mask_mode, ref_pct, ref_sat_limit, ref_min_obj,
                 pp_bg_enable, pp_bg_mode, pp_bg_radius, pp_dark_pct,
                 pp_norm_enable, pp_norm_method,
-                        prof_start, prof_end, prof_window_size, prof_window_step,
-                        prof_smoothing, prof_show_err, profile_show_ratio,
+                prof_start, prof_end, prof_window_size, prof_window_step,
+                prof_smoothing, prof_show_err, profile_show_ratio,
                 peak_min_pct, peak_max_pct, peak_algo, sg_window, sg_poly,
                 ratio_eps, px_w, px_h,
             ],
@@ -797,13 +809,13 @@ def build_ui():
                     // sanitize deprecated algo
                     if (s.peak_algo === 'first_shoulder') s.peak_algo = 'first_local_top';
                     return [
-                        s.seg_source, s.seg_chan, s.diameter, s.flow_th, s.cellprob_th, s.use_gpu,
+                        s.seg_source, s.seg_chan, s.diameter, s.flow_th, s.cellprob_th, s.use_gpu, s.seg_drop_edge,
                         s.tgt_chan, s.tgt_mask_mode, s.tgt_pct, s.tgt_sat_limit, s.tgt_min_obj,
                         s.ref_chan, s.ref_mask_mode, s.ref_pct, s.ref_sat_limit, s.ref_min_obj,
                         s.pp_bg_enable, s.pp_bg_mode, s.pp_bg_radius, s.pp_dark_pct,
                         s.pp_norm_enable, s.pp_norm_method,
                         s.prof_start, s.prof_end, s.prof_window_size, s.prof_window_step,
-                                s.prof_smoothing, s.prof_show_err, s.profile_show_ratio,
+                        s.prof_smoothing, s.prof_show_err, s.profile_show_ratio,
                         s.peak_min_pct, s.peak_max_pct, s.peak_algo, s.sg_window, s.sg_poly,
                         s.ratio_eps, s.px_w, s.px_h,
                     ];
@@ -820,7 +832,7 @@ def build_ui():
             fn=None,
             inputs=[],
             outputs=[
-                seg_source_q, seg_chan_q, diameter_q, flow_th_q, cellprob_th_q, use_gpu_q,
+                seg_source_q, seg_chan_q, diameter_q, flow_th_q, cellprob_th_q, use_gpu_q, seg_drop_edge_q,
                 tgt_chan_q, tgt_mask_mode_q, tgt_pct_q, tgt_sat_limit_q, tgt_min_obj_q,
                 ref_chan_q, ref_mask_mode_q, ref_pct_q, ref_sat_limit_q, ref_min_obj_q,
                 pp_bg_enable_q, pp_bg_mode_q, pp_bg_radius_q, pp_dark_pct_q,
@@ -851,7 +863,7 @@ def build_ui():
                     s.tgt_chan = mapChan(s.tgt_chan);
                     s.ref_chan = mapChan(s.ref_chan);
                     return [
-                        s.seg_source, s.seg_chan, s.diameter, s.flow_th, s.cellprob_th, s.use_gpu,
+                        s.seg_source, s.seg_chan, s.diameter, s.flow_th, s.cellprob_th, s.use_gpu, s.seg_drop_edge,
                         s.tgt_chan, s.tgt_mask_mode, s.tgt_pct, s.tgt_sat_limit, s.tgt_min_obj,
                         s.ref_chan, s.ref_mask_mode, s.ref_pct, s.ref_sat_limit, s.ref_min_obj,
                         s.pp_bg_enable, s.pp_bg_mode, s.pp_bg_radius, s.pp_dark_pct,

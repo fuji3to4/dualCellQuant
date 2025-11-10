@@ -52,6 +52,12 @@ from .visualization import (
     build_radial_profile_grid_image,
 )
 
+# Tracking functions
+from .tracking import (
+    relabel_to_previous,
+    track_sequence,
+)
+
 # UI function
 from .ui import build_ui
 
@@ -89,6 +95,9 @@ __all__ = [
     "plot_radial_profile_with_peaks",
     "save_radial_profile_grid_png",
     "build_radial_profile_grid_image",
+    # Tracking
+    "relabel_to_previous",
+    "track_sequence",
     # UI
     "build_ui",
 ]

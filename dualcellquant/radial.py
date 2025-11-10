@@ -732,7 +732,9 @@ def compute_radial_peak_difference(
             "label", "max_target_center_pct", "max_reference_center_pct", "difference_pct",
             "max_target_px", "max_reference_px", "difference_px",
             "max_target_um", "max_reference_um", "difference_um",
-            "max_target_intensity", "max_reference_intensity",
+            "max_target_intensity", "max_reference_intensity", "ratio_intensity",
+            # Reference RAW quality metrics
+            "ref_range_rel", "ref_noise_rel", "ref_neg_run_after_peak", "accept_ref",
         ])
     
     # Filter by range
@@ -746,7 +748,9 @@ def compute_radial_peak_difference(
             "label", "max_target_center_pct", "max_reference_center_pct", "difference_pct",
             "max_target_px", "max_reference_px", "difference_px",
             "max_target_um", "max_reference_um", "difference_um",
-            "max_target_intensity", "max_reference_intensity",
+            "max_target_intensity", "max_reference_intensity", "ratio_intensity",
+            # Reference RAW quality metrics
+            "ref_range_rel", "ref_noise_rel", "ref_neg_run_after_peak", "accept_ref",
         ])
     
     # Build lookup for equivalent radius per label
@@ -906,12 +910,68 @@ def compute_radial_peak_difference(
 
         max_target_intensity = _get_intensity(lab_data, max_target_pct, "mean_target")
         max_reference_intensity = _get_intensity(lab_data, max_reference_pct, "mean_reference")
+        # Safe ratio of intensities (avoid divide-by-zero); NaN if non-finite
+        if np.isfinite(max_target_intensity) and np.isfinite(max_reference_intensity):
+            ratio_intensity = (float(max_target_intensity) + 1e-12) / (float(max_reference_intensity) + 1e-12)
+        else:
+            ratio_intensity = np.nan
 
         # Calculate difference in %
         if np.isfinite(max_target_pct) and np.isfinite(max_reference_pct):
             diff_pct = max_target_pct - max_reference_pct
         else:
             diff_pct = np.nan
+
+        # --- Reference RAW quality metrics ---
+        # Compute on RAW reference (no SG), within the filtered range for this label
+        try:
+            gref = lab_data[['center_pct', 'mean_reference']].dropna().sort_values('center_pct')
+            cp_arr = gref['center_pct'].to_numpy(dtype=float)
+            vref = gref['mean_reference'].to_numpy(dtype=float)
+            nref = vref.size
+            if nref >= 2:
+                vmin = float(np.nanmin(vref))
+                vmax = float(np.nanmax(vref))
+                amp = max(0.0, vmax - vmin)
+                # Relative range against peak scale (use vmax as scale, robust for non-negative intensities)
+                scale = max(1e-12, vmax)
+                ref_range_rel = amp / scale
+                # Noise as MAD of first differences, relative to amplitude
+                if nref >= 3:
+                    d = np.diff(vref)
+                    med_d = float(np.nanmedian(d)) if np.any(np.isfinite(d)) else 0.0
+                    mad = float(np.nanmedian(np.abs(d - med_d))) if np.any(np.isfinite(d)) else 0.0
+                else:
+                    mad = 0.0
+                ref_noise_rel = mad / max(1e-12, amp)
+                # Negative slope run after the detected peak (use RAW gradient)
+                # Determine tolerance based on amplitude and % range
+                cp_rng = max(1e-12, float(np.nanmax(cp_arr) - np.nanmin(cp_arr)))
+                slope_eps = float(peak_slope_eps_rel) * amp / cp_rng
+                pos_tol = 2.0 * slope_eps
+                dv_raw = np.gradient(vref, cp_arr) if nref >= 2 else np.array([])
+                # Find index nearest to the detected reference peak percentage
+                if np.isfinite(max_reference_pct) and nref > 0:
+                    idx0 = int(np.nanargmin(np.abs(cp_arr - float(max_reference_pct))))
+                else:
+                    idx0 = 0
+                neg_run = 0
+                k = max(0, idx0)
+                while (k < (nref - 1)) and np.isfinite(dv_raw[k]):
+                    if dv_raw[k] <= -pos_tol:
+                        neg_run += 1
+                        k += 1
+                    else:
+                        break
+                ref_neg_run_after_peak = int(neg_run)
+            else:
+                ref_range_rel = np.nan
+                ref_noise_rel = np.nan
+                ref_neg_run_after_peak = 0
+        except Exception:
+            ref_range_rel = np.nan
+            ref_noise_rel = np.nan
+            ref_neg_run_after_peak = 0
         
         # Convert to pixel and um using equivalent radius
         # r_eq represents the distance from 0% (center) to 100% (boundary)
@@ -935,6 +995,21 @@ def compute_radial_peak_difference(
         else:
             max_target_um = max_reference_um = diff_um = np.nan
         
+        # Acceptance based on thresholds (tunable later via UI if needed)
+        RANGE_MIN_REL = 0.08
+        NOISE_MAX_REL = 0.10
+        NEG_RUN_MIN = 2
+        REF_PEAK_MAX_PCT = 98.0  # reject if reference peak is too close to/outside boundary
+        try:
+            accept_ref = bool(
+                (np.isfinite(ref_range_rel) and ref_range_rel >= RANGE_MIN_REL) and
+                (np.isfinite(ref_noise_rel) and ref_noise_rel <= NOISE_MAX_REL) and
+                (int(ref_neg_run_after_peak) >= int(NEG_RUN_MIN)) and
+                (np.isfinite(max_reference_pct) and float(max_reference_pct) <= REF_PEAK_MAX_PCT)
+            )
+        except Exception:
+            accept_ref = False
+
         results.append({
             "label": lab_int,
             "max_target_center_pct": max_target_pct,
@@ -948,6 +1023,12 @@ def compute_radial_peak_difference(
             "difference_um": diff_um,
             "max_target_intensity": max_target_intensity,
             "max_reference_intensity": max_reference_intensity,
+            "ratio_intensity": ratio_intensity,
+            # Quality metrics for Reference RAW
+            "ref_range_rel": ref_range_rel,
+            "ref_noise_rel": ref_noise_rel,
+            "ref_neg_run_after_peak": ref_neg_run_after_peak,
+            "accept_ref": accept_ref,
         })
     
     return pd.DataFrame(results).sort_values("label")
