@@ -320,9 +320,19 @@ def run_segmentation(
             for lab in labs_on_edge:
                 if lab > 0:
                     keep[int(lab)] = False
-        # Apply filter & relabel compactly
-        filt = np.where(keep[masks], masks, 0)
-        masks = measure.label(filt > 0, connectivity=1)
+        # Apply filter & relabel compactly WITHOUT merging adjacent kept labels.
+        # Note: converting to binary and calling measure.label merges touching labels.
+        # To preserve original separations, remap kept labels to a compact range directly.
+        kept_labels = np.flatnonzero(keep)
+        kept_labels = kept_labels[kept_labels > 0]
+        if kept_labels.size == 0:
+            masks = np.zeros_like(masks, dtype=np.int32)
+        else:
+            new_masks = np.zeros_like(masks, dtype=np.int32)
+            # Map each kept label to a new consecutive id, preserving boundaries
+            for new_id, lab in enumerate(kept_labels, start=1):
+                new_masks[masks == int(lab)] = int(new_id)
+            masks = new_masks
 
     overlay = colorize_overlay(seg_gray, masks, None)
     overlay = annotate_ids(overlay, masks)
@@ -512,7 +522,7 @@ def integrate_and_quantify(
             "sum_ratio_T_over_R": ratio_sum,
             "mean_ratio_T_over_R": ratio_mean,
             "std_ratio_T_over_R": ratio_std,
-            "ratio_of_means_on_all_pixels": ratio_of_means_all,
+            "ratio_of_means_on_mask": ratio_of_means_all,
             "sum_target_whole": sum_t_whole,
             "mean_target_whole": mean_t_whole,
             "std_target_whole": std_t_whole,

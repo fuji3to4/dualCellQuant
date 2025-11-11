@@ -5,6 +5,13 @@ This file is STABLE - do not modify unless necessary.
 
 import gradio as gr
 import tempfile
+"""
+Callback functions for Step-by-Step tab.
+This file is STABLE - do not modify unless necessary.
+"""
+
+import gradio as gr
+import tempfile
 import pandas as pd
 import numpy as np
 
@@ -29,6 +36,7 @@ def create_stepbystep_callbacks(components):
     flow_th = components['flow_th']
     cellprob_th = components['cellprob_th']
     use_gpu = components['use_gpu']
+    seg_drop_edge = components['seg_drop_edge']
     
     run_seg_btn = components['run_seg_btn']
     seg_overlay = components['seg_overlay']
@@ -40,6 +48,11 @@ def create_stepbystep_callbacks(components):
     prof_cache_csv_state = components['prof_cache_csv_state']
     prof_cache_plot_state = components['prof_cache_plot_state']
     prof_cache_params_state = components['prof_cache_params_state']
+    
+    # Relabel controls
+    prev_label_tiff = components.get('prev_label_tiff')
+    iou_match_th = components.get('iou_match_th')
+    relabel_btn = components.get('relabel_btn')
     
     tgt_chan = components['tgt_chan']
     tgt_mask_mode = components['tgt_mask_mode']
@@ -131,6 +144,7 @@ def create_stepbystep_callbacks(components):
     
     # Segmentation
     def _run_seg(tgt_img, ref_img, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu, drop_edge):
+        # Align behavior with Quick tab: allow mild border contact but drop largely truncated cells
         ov, seg_tif, mask_viz, masks = run_segmentation(
             tgt_img, ref_img, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu,
             drop_edge_cells=bool(drop_edge), inside_fraction_min=0.98, edge_margin_pct=1.0,
@@ -140,9 +154,58 @@ def create_stepbystep_callbacks(components):
     
     run_seg_btn.click(
         fn=_run_seg,
-        inputs=[tgt, ref, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu, components['seg_drop_edge']],
+        inputs=[tgt, ref, seg_source, seg_chan, diameter, flow_th, cellprob_th, use_gpu, seg_drop_edge],
         outputs=[seg_overlay, seg_tiff_file, mask_img, masks_state, prof_cache_df_state, prof_cache_csv_state, prof_cache_plot_state, prof_cache_params_state],
     )
+
+    # Relabel current masks to previous IDs
+    def _extract_path(obj):
+        if obj is None:
+            return None
+        if isinstance(obj, str):
+            return obj
+        if isinstance(obj, dict):
+            return obj.get('path') or obj.get('name')
+        if isinstance(obj, (list, tuple)) and obj:
+            it = obj[0]
+            if isinstance(it, dict):
+                return it.get('path') or it.get('name')
+            if isinstance(it, str):
+                return it
+        return None
+
+    def _relabel_cb(tgt_img, ref_img, seg_src, seg_ch, prev_file, curr_masks, iou_th):
+        try:
+            import PIL.Image as _PIL
+            if curr_masks is None:
+                return gr.update(), gr.update(), gr.update(), None, None, None, None, None
+            pth = _extract_path(prev_file)
+            if not pth:
+                return gr.update(), gr.update(), gr.update(), None, None, None, None, None
+            prev_arr = np.array(_PIL.open(pth))
+            if prev_arr.ndim != 2:
+                prev_arr = np.squeeze(prev_arr)
+            prev_arr = prev_arr.astype(np.int32, copy=False)
+            curr = np.array(curr_masks).astype(np.int32, copy=False)
+            if prev_arr.shape != curr.shape:
+                return gr.update(), gr.update(), gr.update(), None, None, None, None, None
+            rel, df_map, _ = relabel_to_previous(prev_arr, curr, iou_threshold=float(iou_th))
+            seg_arr = pil_to_numpy(tgt_img) if str(seg_src) == 'target' else pil_to_numpy(ref_img)
+            seg_gray = extract_single_channel(seg_arr, seg_ch)
+            ov = colorize_overlay(seg_gray, rel, None)
+            ov = annotate_ids(ov, rel)
+            mask_viz = vivid_label_image(rel)
+            tiff_path = save_label_tiff(rel, "seg_labels_relabel")
+            return ov, tiff_path, mask_viz, rel, None, None, None, None
+        except Exception:
+            return gr.update(), gr.update(), gr.update(), None, None, None, None, None
+
+    if relabel_btn is not None:
+        relabel_btn.click(
+            fn=_relabel_cb,
+            inputs=[tgt, ref, seg_source, seg_chan, prev_label_tiff, masks_state, iou_match_th],
+            outputs=[seg_overlay, seg_tiff_file, mask_img, masks_state, prof_cache_df_state, prof_cache_csv_state, prof_cache_plot_state, prof_cache_params_state],
+        )
     
     # Radial mask
     def _radial_and_quantify(tgt_img, ref_img, masks, rin, rout, mino, tmask, rmask, tchan, rchan, pw, ph, bg_en, bg_mode, bg_r, dark_pct, nm_en, nm_m, man_t, man_r, eps):
@@ -336,8 +399,8 @@ def create_stepbystep_callbacks(components):
             parts = []
             for _, g in df.groupby('label', sort=False):
                 parts.append(_smooth_group(g))
-            out = pd.concat(parts, ignore_index=True) if parts else df.copy()
-            return out
+            out = pd.concat(parts, axis=0, ignore_index=True)
+            return out.reset_index(drop=True)
         except Exception:
             return df.copy()
     
@@ -360,21 +423,6 @@ def create_stepbystep_callbacks(components):
         except Exception:
             slope_rel = 0.001
         peak_df = compute_radial_peak_difference(cached_df, quant_df, float(min_pct), float(max_pct), algo=algo, sg_window=w, sg_poly=p, peak_slope_eps_rel=slope_rel)
-        # Ensure intensity columns are present and column order is user-friendly
-        try:
-            preferred_cols = [
-                "label",
-                "max_target_center_pct", "max_reference_center_pct", "difference_pct",
-                "max_target_px", "max_reference_px", "difference_px",
-                "max_target_um", "max_reference_um", "difference_um",
-                "max_target_intensity", "max_reference_intensity", "ratio_intensity",
-                # Reference RAW quality metrics
-                "ref_range_rel", "ref_noise_rel", "ref_neg_run_after_peak", "accept_ref",
-            ]
-            cols = [c for c in preferred_cols if c in peak_df.columns] + [c for c in peak_df.columns if c not in preferred_cols]
-            peak_df = peak_df[cols]
-        except Exception:
-            pass
         
         if peak_df.empty:
             return gr.update(value=pd.DataFrame()), None, gr.update(), None
@@ -475,6 +523,15 @@ def create_stepbystep_callbacks(components):
         outputs=[integrate_tar_overlay, integrate_ref_overlay, mask_tiff, table, csv_file, tgt_on_and_img, ref_on_and_img, ratio_img, bak_tar, bak_ref, quant_df_state],
     )
 
+    def _set_label_scale(v: float):
+        # Propagate to package-level so visualization uses the latest value
+        try:
+            dcq.LABEL_SCALE = float(v)
+        except Exception:
+            pass
+        return None
+    
+    label_scale.change(fn=_set_label_scale, inputs=[label_scale], outputs=[])
     def _set_label_scale(v: float):
         # Propagate to package-level so visualization uses the latest value
         try:
