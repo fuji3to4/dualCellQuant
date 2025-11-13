@@ -103,14 +103,14 @@ def build_ui():
                                 with gr.Column():
                                     gr.Markdown("**Target mask settings**")
                                     tgt_chan = gr.Radio(["gray","R","G","B"], value="gray", label="Target channel")
-                                    tgt_mask_mode = gr.Dropdown(["none","global_percentile","global_otsu","per_cell_percentile","per_cell_otsu"], value="global_percentile", label="Masking mode")
+                                    tgt_mask_mode = gr.Dropdown(["none","global_percentile","global_otsu","per_cell_percentile","per_cell_otsu"], value="none", label="Masking mode")
                                     tgt_pct = gr.Slider(0.0, 100.0, value=75.0, step=1.0, label="Percentile (Top p%)")
                                     tgt_sat_limit = gr.Slider(0, 255, value=254, step=1, label="Saturation limit (abs, 8-bit scale)")
                                     tgt_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
                                 with gr.Column():
                                     gr.Markdown("**Reference mask settings**")
                                     ref_chan = gr.Radio(["gray","R","G","B"], value="gray", label="Reference channel")
-                                    ref_mask_mode = gr.Dropdown(["none","global_percentile","global_otsu","per_cell_percentile","per_cell_otsu"], value="global_percentile", label="Masking mode")
+                                    ref_mask_mode = gr.Dropdown(["none","global_percentile","global_otsu","per_cell_percentile","per_cell_otsu"], value="none", label="Masking mode")
                                     ref_pct = gr.Slider(0.0, 100.0, value=75.0, step=1.0, label="Percentile (Top p%)")
                                     ref_sat_limit = gr.Slider(0, 255, value=254, step=1, label="Saturation limit (abs, 8-bit scale)")
                                     ref_min_obj = gr.Slider(0, 2000, value=50, step=10, label="Remove small objects (px)")
@@ -320,8 +320,8 @@ def build_ui():
                                 seg_source: 'target', seg_chan: 'gray', diameter: 0, flow_th: 0.4, cellprob_th: 0.0, use_gpu: true, seg_drop_edge: true,
                                 pp_bg_enable: false, pp_bg_mode: 'rolling', pp_bg_radius: 50, pp_dark_pct: 5.0, pp_norm_enable: false, pp_norm_method: 'z-score',
                                 rad_in: 0.0, rad_out: 100.0, rad_min_obj: 50,
-                                tgt_chan: 'gray', tgt_mask_mode: 'global_percentile', tgt_sat_limit: 254, tgt_pct: 75.0, tgt_min_obj: 50,
-                                ref_chan: 'gray', ref_mask_mode: 'global_percentile', ref_sat_limit: 254, ref_pct: 75.0, ref_min_obj: 50,
+                                tgt_chan: 'gray', tgt_mask_mode: 'none', tgt_sat_limit: 254, tgt_pct: 75.0, tgt_min_obj: 50,
+                                ref_chan: 'gray', ref_mask_mode: 'none', ref_sat_limit: 254, ref_pct: 75.0, ref_min_obj: 50,
                                 px_w: 1.0, px_h: 1.0,
                                 prof_start: 0.0, prof_end: 150.0, prof_window_size: 10.0, prof_window_step: 5.0, prof_smoothing: 1, prof_show_err: true, profile_show_ratio: true,
                                 peak_min_pct: 60.0, peak_max_pct: 120.0, peak_algo: 'global_max', sg_window: 5, sg_poly: 2, peak_slope_eps_rel: 0.001,
@@ -525,7 +525,7 @@ def build_ui():
                                     tgt_chan_q = gr.Radio(["gray", "R", "G", "B"], value="gray", label="Ch")
                                     tgt_mask_mode_q = gr.Dropdown(
                                         ["none", "global_percentile", "global_otsu", "per_cell_percentile", "per_cell_otsu"],
-                                        value="global_percentile", label="Mode")
+                                        value="none", label="Mode")
                                     tgt_pct_q = gr.Slider(0.0, 100.0, value=75.0, step=1.0, label="Pct")
                                     tgt_sat_limit_q = gr.Slider(0, 255, value=254, step=1, label="Sat")
                                     tgt_min_obj_q = gr.Slider(0, 2000, value=50, step=10, label="Min")
@@ -534,7 +534,7 @@ def build_ui():
                                     ref_chan_q = gr.Radio(["gray", "R", "G", "B"], value="gray", label="Ch")
                                     ref_mask_mode_q = gr.Dropdown(
                                         ["none", "global_percentile", "global_otsu", "per_cell_percentile", "per_cell_otsu"],
-                                        value="global_percentile", label="Mode")
+                                        value="none", label="Mode")
                                     ref_pct_q = gr.Slider(0.0, 100.0, value=75.0, step=1.0, label="Pct")
                                     ref_sat_limit_q = gr.Slider(0, 255, value=254, step=1, label="Sat")
                                     ref_min_obj_q = gr.Slider(0, 2000, value=50, step=10, label="Min")
