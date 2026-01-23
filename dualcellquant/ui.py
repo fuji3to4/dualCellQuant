@@ -66,16 +66,38 @@ def build_ui():
                 radial_quant_df_state = gr.State()  # Store radial quantification DataFrame
                 with gr.Row():
                     with gr.Column():
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                with gr.Accordion("Settings", open=False):
+                                    reset_settings = gr.Button("Reset All Parameters",scale=1)
+                                    label_scale = gr.Slider(0.0, 5.0, value=float(LABEL_SCALE), step=0.1, label="Label size scale (0=hidden)")
+                                    # hidden state used to pass JS-initialized value into Python on load
+                                    label_scale_init_state = gr.State()
+                            with gr.Column(scale=1):
+                                gr.Markdown("")
+                                
                         gr.Markdown("## Input Images")
                         with gr.Row():
                             tgt = gr.Image(type="pil", label="Target image", image_mode="RGB", width=600)
                             ref = gr.Image(type="pil", label="Reference image", image_mode="RGB", width=600)
                         
-                        with gr.Accordion("Settings", open=False):
-                            reset_settings = gr.Button("Reset Settings",scale=1)
-                            label_scale = gr.Slider(0.0, 5.0, value=float(LABEL_SCALE), step=0.1, label="Label size scale (0=hidden)")
-                            # hidden state used to pass JS-initialized value into Python on load
-                            label_scale_init_state = gr.State()
+
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                gr.Examples(
+                                    examples=[
+                                        [
+                                            "https://github.com/fuji3to4/DualCellQuant/raw/main/examples/data/5.0_C001Z002.png",
+                                            "https://github.com/fuji3to4/DualCellQuant/raw/main/examples/data/5.0_C002Z002.png"
+                                        ],
+                                    ],
+                                    inputs=[tgt, ref],
+                                    label="💡 Try sample images",
+                                )
+                            with gr.Column(scale=1):
+                                gr.Markdown("")
+                        
+
                         gr.Markdown("## 1. Run Cellpose-SAM Segmentation")
                         with gr.Accordion("Segmentation params", open=True):
                             seg_source = gr.Radio(["target","reference"], value="target", label="Segment on")
@@ -505,6 +527,21 @@ def build_ui():
                         with gr.Row():
                             tgt_quick = gr.Image(type="pil", label="Target image", image_mode="RGB", width=600)
                             ref_quick = gr.Image(type="pil", label="Reference image", image_mode="RGB", width=600)
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                gr.Examples(
+                                    examples=[
+                                        [
+                                            "https://github.com/fuji3to4/DualCellQuant/raw/main/examples/data/5.0_C001Z002.png",
+                                            "https://github.com/fuji3to4/DualCellQuant/raw/main/examples/data/5.0_C002Z002.png"
+                                        ],
+                                    ],
+                                    inputs=[tgt_quick, ref_quick],
+                                    label="💡 Try sample images",
+                                    elem_id="examples_radial"
+                                )
+                            with gr.Column(scale=1):
+                                gr.Markdown("")
                         
                         gr.Markdown("## Settings")
                         gr.Markdown("*⚙️ Settings are shared with Step-by-Step tab via browser storage*")
